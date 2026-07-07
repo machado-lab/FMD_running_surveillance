@@ -53,9 +53,10 @@ def build_movement_network(file_path, out_pkl=None):
             "DATA_EMISSAO",
             "COD_PROPRIEDADE_ORIGEM",
             "COD_PROPRIEDADE_DESTINO",
+            "species_group",
             "animal_total",
         ]
-    ].dropna()
+    ].dropna(subset=["COD_PROPRIEDADE_ORIGEM", "COD_PROPRIEDADE_DESTINO", "animal_total"])
 
     def normalize_farm_id(series):
         s = series.astype(str).str.strip()
@@ -67,8 +68,85 @@ def build_movement_network(file_path, out_pkl=None):
     df["COD_PROPRIEDADE_ORIGEM"] = normalize_farm_id(df["COD_PROPRIEDADE_ORIGEM"])
     df["COD_PROPRIEDADE_DESTINO"] = normalize_farm_id(df["COD_PROPRIEDADE_DESTINO"])
     df["animal_total"] = pd.to_numeric(df["animal_total"], errors="coerce")
+    # parse the emission date (Brazilian day-first format, matching 3_1_road_animal_preassure.py)
+    df["DATA_EMISSAO"] = pd.to_datetime(df["DATA_EMISSAO"], dayfirst=True, errors="coerce")
 
     df = df.dropna(subset=["COD_PROPRIEDADE_ORIGEM", "COD_PROPRIEDADE_DESTINO", "animal_total"])
+
+    def compute_loyalty(mov):
+        """Temporal trading-partner loyalty per farm.
+
+        For each farm and species we tile the farm's movement history into
+        non-overlapping windows (365 days for cattle/buffalo and small
+        ruminants, 183 days for swine), build the set of unique trading
+        partners in each window, and compute the Jaccard similarity between
+        every consecutive window pair. A farm's species loyalty is
+        ``1 - mean(Jaccard)`` (so values close to 1 mean the farm keeps
+        changing partners = low loyalty = higher risk), and its overall
+        loyalty is the mean across the species it trades. Farms with no
+        eligible consecutive window pair get NaN (imputed by the mean upstream).
+
+        Returns a DataFrame with columns [farm_id, loyalty].
+        """
+        WINDOW_DAYS = {
+            "bovine_bubalinos": 365,
+            "ovinos_caprinos": 365,
+            "suinos": 183,
+        }
+
+        m = mov.dropna(subset=["DATA_EMISSAO", "species_group"]).copy()
+        # long farm -> partner table: each movement contributes two rows so a
+        # partner counts whether the focal farm is the origin or the destination
+        origin_side = m.rename(
+            columns={"COD_PROPRIEDADE_ORIGEM": "farm_id",
+                     "COD_PROPRIEDADE_DESTINO": "partner"}
+        )[["farm_id", "partner", "species_group", "DATA_EMISSAO"]]
+        dest_side = m.rename(
+            columns={"COD_PROPRIEDADE_DESTINO": "farm_id",
+                     "COD_PROPRIEDADE_ORIGEM": "partner"}
+        )[["farm_id", "partner", "species_group", "DATA_EMISSAO"]]
+        long = pd.concat([origin_side, dest_side], ignore_index=True)
+        long = long[long["species_group"].isin(WINDOW_DAYS)]
+
+        records = []
+        for (farm_id, species), grp in long.groupby(["farm_id", "species_group"]):
+            window_days = WINDOW_DAYS[species]
+            t0 = grp["DATA_EMISSAO"].min()
+            win_idx = ((grp["DATA_EMISSAO"] - t0).dt.days // window_days)
+            # unique partner set per non-overlapping window
+            partners_by_window = (
+                grp.assign(_win=win_idx)
+                   .groupby("_win")["partner"]
+                   .apply(lambda s: set(s.dropna()))
+            )
+            keys = sorted(partners_by_window.index)
+            jaccards = []
+            for prev_k, cur_k in zip(keys[:-1], keys[1:]):
+                a = partners_by_window[prev_k]
+                b = partners_by_window[cur_k]
+                if not a or not b:
+                    continue
+                union = a | b
+                if not union:
+                    continue
+                jaccards.append(len(a & b) / len(union))
+            if jaccards:
+                records.append(
+                    (farm_id, species, 1.0 - float(np.mean(jaccards)))
+                )
+
+        if not records:
+            return pd.DataFrame({"farm_id": [], "loyalty": []})
+
+        sp_loyalty = pd.DataFrame(
+            records, columns=["farm_id", "species_group", "species_loyalty"]
+        )
+        farm_loyalty = (
+            sp_loyalty.groupby("farm_id", as_index=False)["species_loyalty"]
+                      .mean()
+                      .rename(columns={"species_loyalty": "loyalty"})
+        )
+        return farm_loyalty
 
     edges = (
         df.groupby(
@@ -119,6 +197,21 @@ def build_movement_network(file_path, out_pkl=None):
         + 0.5 * degree_df["total_degree"]
 
     )
+
+    # ------------------------------------------------------------------
+    # Temporal loyalty: fold the trading-partner consistency metric into
+    # the network component with 70% network / 30% loyalty weighting.
+    # ------------------------------------------------------------------
+    loyalty_df = compute_loyalty(df)
+    degree_df = degree_df.merge(loyalty_df, on="farm_id", how="left")
+    # farms with no eligible window pair get the mean of the distribution
+    degree_df["loyalty"] = degree_df["loyalty"].fillna(degree_df["loyalty"].mean())
+    # keep the pre-loyalty score for auditing, then combine
+    degree_df["network_risk_base"] = degree_df["network_risk_score"]
+    degree_df["network_risk_score"] = (
+        0.70 * degree_df["network_risk_base"]
+        + 0.30 * degree_df["loyalty"]
+    ).clip(0, 1)
 
     if out_pkl:
         degree_df.to_pickle(str(out_pkl))
@@ -616,7 +709,9 @@ slaughterhouse_df = slaughterhouse_proximity_risk(
 #
 # 1. NETWORK ANALYSIS
 #    → intermediate/network_farms_rank.pkl
-#    Columns: farm_id, in_degree, out_degree, total_degree (weighted & unweighted), network_risk_score
+#    Columns: farm_id, in_degree, out_degree, total_degree (weighted & unweighted),
+#             loyalty, network_risk_base, network_risk_score
+#    network_risk_score = 0.70 * network_risk_base + 0.30 * temporal loyalty
 #
 # 2. FARM DENSITY PRESSURE
 #    → intermediate/farm_density_pressure.pkl
