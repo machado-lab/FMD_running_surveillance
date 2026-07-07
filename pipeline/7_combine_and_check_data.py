@@ -124,7 +124,7 @@ combined_df = cadastro.copy()
 n_initial = combined_df["COD_PROPRIEDADE_RURAL"].nunique()
 print(f"Initial unique farms: {n_initial}, total rows: {len(combined_df)}")
 
-# Merge network features
+# Merge network features 1
 network_df = network_df[["farm_id", "network_risk_score"]].copy()
 network_df["farm_id"] = pd.to_numeric(network_df["farm_id"], errors='coerce').astype("Int64")
 network_df = network_df.drop_duplicates(subset=["farm_id"])
