@@ -10,8 +10,6 @@ other individual-identifying information.
 What it replaces (sensitive):
   - raw_data/cadastro/*.csv
   - raw_data/gtas/{bovine,bubaline,ovi,capri,suine}_movs/*.csv
-  - raw_data/sisbravet/Relatorio_Ocorrencia_*.xlsx
-  - raw_data/PNEFA_epicollec_bio_records/form-1__form-pvbr.csv
 
 What it leaves untouched (public-safe):
   - roads, border, rs_boundary_ibge, hydro, LST temperature rasters,
@@ -20,13 +18,10 @@ What it leaves untouched (public-safe):
 Design notes:
   - Every file's REAL header/columns are read first, then only the contents are
     replaced — so schemas stay byte-for-byte compatible with the loaders.
-  - A single synthetic "farm table" (id, IBGE, CPF, coords) drives all four
-    datasets so cross-file joins (cadastro <-> GTAS <-> Epicollect <-> SISBRAVET)
-    stay consistent and the pipeline does not crash on empty joins.
-  - Municipality (code, name) pairs come from geobr, the same source step 6
-    uses to resolve SISBRAVET município names to IBGE codes. This guarantees the
-    CPF + município FMD label join yields a non-trivial positive class so the
-    10-fold cross-validation in step 6 does not fail on a single-class target.
+  - A single synthetic "farm table" (id, IBGE, CPF, coords) drives both
+    datasets so cross-file joins (cadastro <-> GTAS) stay consistent and the
+    pipeline does not crash on empty joins.
+  - Municipality (code, name) pairs come from geobr.
   - Coordinates use a dot decimal separator (as in the originals); area uses a
     Brazilian comma decimal separator (step 8 converts it).
 
@@ -44,7 +39,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.paths import (
-    CADASTRO_DIR, GTAS_DIR, SISBRAVET_DIR, EPICOLLECT_CSV,
+    CADASTRO_DIR, GTAS_DIR,
 )
 
 # ---------------------------------------------------------------------------
@@ -52,8 +47,6 @@ from src.paths import (
 # ---------------------------------------------------------------------------
 SEED = 42
 N_FARMS = 2500            # synthetic farms in the cadastro
-N_VISITED = 250           # farms with an Epicollect biosecurity record
-N_FMD_POSITIVE = 70       # visited farms flagged as FMD cases (>= 1 per CV fold)
 N_MOV = {                 # movement records per GTAS species folder
     "bovine_movs": 1500,
     "bubaline_movs": 300,
@@ -61,7 +54,6 @@ N_MOV = {                 # movement records per GTAS species folder
     "capri_movs": 250,
     "suine_movs": 1200,
 }
-N_SISBRAVET_EXTRA = 150   # extra (non-matching) surveillance rows
 N_SLAUGHTERHOUSES = 20    # abattoir destinations (NOT farms; short codes < 6 digits)
 SLAUGHTER_FRACTION = 0.25 # share of movements shipped to a slaughterhouse
 
@@ -74,9 +66,6 @@ CADASTRO_ESPECIES = [
     "Bovinos", "Ovino", "Suíno", "Caprinos", "Bubalinos",
     "Galinha", "Pato", "Peru", "Galinha de Angola",
 ]
-# FMD-susceptible species accepted by the SISBRAVET loader (4_...py)
-SISBRAVET_ESPECIES = ["Bovino", "Suíno", "Ovino", "Caprino"]
-
 # Species-specific total column per GTAS folder (see 1_load_data.py)
 GTAS_TOT_COL = {
     "bovine_movs": "BOVINO_TOT",
@@ -94,11 +83,7 @@ random.seed(SEED)
 # Helpers
 # ---------------------------------------------------------------------------
 def rs_municipalities():
-    """Authoritative (IBGE code, name) pairs for RS, via geobr.
-
-    Same source step 6 uses to map município name -> IBGE code, so the FMD
-    label join is guaranteed to resolve.
-    """
+    """Authoritative (IBGE code, name) pairs for RS, via geobr."""
     import geobr
     m = geobr.read_municipality(code_muni="RS", year=2020)
     m = m[["code_muni", "name_muni"]].dropna()
@@ -256,113 +241,12 @@ def write_gtas(farms, slaughter):
 
 
 # ---------------------------------------------------------------------------
-# 3. SISBRAVET surveillance (FMD labels)
-# ---------------------------------------------------------------------------
-def write_sisbravet(farms):
-    files = sorted(glob.glob(str(SISBRAVET_DIR / "*.xlsx")))
-    if not files:
-        print("  (no SISBRAVET xlsx found — skipping)")
-        return
-    cols = list(pd.read_excel(files[0], nrows=0).columns)
-
-    # Positive cases: the first N_FMD_POSITIVE *visited* farms (so the Epicollect
-    # training set has both classes). Same CPF + município as in the cadastro.
-    pos = farms.iloc[:N_FMD_POSITIVE]
-    n_pos = len(pos)
-    n = n_pos + N_SISBRAVET_EXTRA
-
-    lat, lon = rand_coords(n)
-    df = pd.DataFrame("", index=range(n), columns=cols)
-    df["Número da ocorrência"] = [str(900000 + i) for i in range(n)]
-    df["UF"] = "RS"
-    # First block = real matches; remainder = unrelated extras.
-    muni = list(pos["muni_name"].values) + list(
-        rng.choice(farms["muni_name"].values, N_SISBRAVET_EXTRA)
-    )
-    cpf = list(pos["cpf"].values) + fake_cpfs(N_SISBRAVET_EXTRA)
-    df["Município"] = muni
-    df["CPF"] = cpf
-    df["Nome da propriedade"] = ""
-    df["Latitude"] = [f"{v:.6f}".replace(".", ",") for v in lat]
-    df["Longitude"] = [f"{v:.6f}".replace(".", ",") for v in lon]
-    df["Espécie"] = rng.choice(SISBRAVET_ESPECIES, n)
-    df["Situação"] = rng.choice(["Suspeita", "Confirmada", "Descartada"], n)
-    df["Diagnóstico final"] = "Ausência de sinais clínicos"
-    for c in ["Data de provável início", "Data da notificação", "Data do atendimento inicial"]:
-        if c in df.columns:
-            df[c] = dmy(n)
-    for c in ["Número de susceptíveis", "Número de casos confirmados",
-              "Número de casos prováveis", "Número de mortos",
-              "Número de destruídos", "Número de abatidos"]:
-        if c in df.columns:
-            df[c] = rng.integers(0, 50, n)
-
-    # Distribute across the existing file names (keeps the *_a_*.xlsx pattern).
-    chunks = np.array_split(df.sample(frac=1, random_state=SEED).reset_index(drop=True), len(files))
-    for path, chunk in zip(files, chunks):
-        chunk.to_excel(path, index=False)
-    print(f"  sisbravet: {n:,} rows ({n_pos} FMD-positive) across {len(files)} file(s)")
-
-
-# ---------------------------------------------------------------------------
-# 4. Epicollect biosecurity survey
-# ---------------------------------------------------------------------------
-def write_epicollect(farms):
-    if not EPICOLLECT_CSV.exists():
-        print("  (no Epicollect CSV found — skipping)")
-        return
-    cols = list(pd.read_csv(EPICOLLECT_CSV, encoding="utf-8-sig", nrows=0).columns)
-
-    visited = farms.iloc[:N_VISITED]
-    n = len(visited)
-    df = pd.DataFrame("", index=range(n), columns=cols)
-    if "ec5_uuid" in df.columns:
-        df["ec5_uuid"] = [f"mock-{i:05d}" for i in range(n)]
-    df["title"] = ""
-    if "2_1_UF" in df.columns:
-        df["2_1_UF"] = "RS"
-    if "3_2_Cdigo_do_IBGE__N" in df.columns:
-        df["3_2_Cdigo_do_IBGE__N"] = visited["ibge"].values
-    df["4_3_Cdigo_do_Estabel"] = visited["farm_id"].values  # join key -> cadastro
-
-    # Biosecurity features used by the model (6_...py). Count columns numeric,
-    # the rest categorical Sim/Não so the ColumnTransformer has both types.
-    count_cols = ["17_Nmero_de_Bovinos", "18_Nmero_de_Bubalino", "19_Nmero_de_Sunos",
-                  "20_Nmero_de_Caprinos", "21_Nmero_de_Ovinos"]
-    feature_cols = [
-        '13_6_A_propriedade_t', '14_7_Havia_placa_de_', '15_8_Na_entrada_da_p',
-        '22_9_H_diferentes_es', '23_10_Finalidade_Pri', '24_11_Qual_o_destino',
-        '25_12_Tipo_de_criao_', '26_13_Grau_de_tecnif', '27_14_H_animais_conf',
-        '28_15_O_pastopiquete', '29_16_H_fonte_de_gua', '30_17_A_propriedade_',
-        '31_18_Com_que_frequn', '32_19_H_compartilham', '33_20_Com_que_frequn',
-        '34_21_Aps_retornar_d', '35_22_Com_que_frequn', '36_23_Os_animais_rec',
-        '37_24_Com_que_frequn', '38_25_Qual_o_mtodo_d', '39_26_H_fornecimento',
-        '40_27_H_compartilham', '41_28_H_compartilham', '42_29_H_entrada_de_v',
-        '43_30_H_compartilham', '44_31_A_propriedade_', '46_32_Ao_fazer_a_ins',
-        '47_33_Ao_fazer_inspe', '48_34_Durante_a_sua_', '50_35_Com_qual_frequ',
-        '51_36_O_Sr_a_conhece', '52_37_O_Sr_a_sabe_co', '54_38_Senhora_veteri',
-        '55_Bovinos', '56_Bubalinos', '57_Sunos', '58_Caprinos', '59_Ovinos',
-    ]
-    for c in count_cols:
-        if c in df.columns:
-            df[c] = rng.integers(0, 500, n)
-    for c in feature_cols:
-        if c in df.columns:
-            df[c] = rng.choice(["Sim", "Não"], n)
-
-    df.to_csv(EPICOLLECT_CSV, index=False, encoding="utf-8-sig")
-    print(f"  epicollect: {n} visited farms -> {EPICOLLECT_CSV.name}")
-
-
-# ---------------------------------------------------------------------------
 def main():
     print("Generating synthetic mock raw data ...")
     farms = build_farm_table()
     slaughter = build_slaughterhouses(farms)
     write_cadastro(farms)
     write_gtas(farms, slaughter)
-    write_sisbravet(farms)
-    write_epicollect(farms)
     print(f"  ({len(slaughter)} slaughterhouse destinations; movement origins/destinations "
           "are cadastro farms except abattoirs)")
     print("Done. Real GPS / names / CPF have been replaced with synthetic values.")

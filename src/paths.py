@@ -32,8 +32,6 @@ CADASTRO_DIR    = RAW_DATA / "cadastro"
 GTAS_DIR        = RAW_DATA / "gtas"
 JAVALI_DIR      = RAW_DATA / "javali_data"
 ROADS_SHP       = RAW_DATA / "roads" / "roads_rs_major.shp"
-SISBRAVET_DIR   = RAW_DATA / "sisbravet"
-EPICOLLECT_CSV  = RAW_DATA / "PNEFA_epicollec_bio_records" / "form-1__form-pvbr.csv"
 RS_BOUNDARY_SHP = RAW_DATA / "rs_boundary_ibge" / "RS_UF_2024.shp"
 BORDER_DIR      = RAW_DATA / "border"
 HYDRO_DIR       = RAW_DATA / "hydro"
@@ -51,8 +49,6 @@ FARM_DENSITY_PKL        = INTERMEDIATE / "farm_density_pressure.pkl"
 ANIMAL_PRESSURE_PKL     = INTERMEDIATE / "animal_pressure_within_radius.pkl"
 DISTANCE_ROADS_PKL      = INTERMEDIATE / "distance_to_roads.pkl"
 SLAUGHTERHOUSE_PKL      = INTERMEDIATE / "slaughterhouse_proximity_risk.pkl"
-SISBRAVET_PKL           = INTERMEDIATE / "sisbravet_fmd_combined.pkl"
-BIOSEC_PKL              = INTERMEDIATE / "cadastro_with_risk.pkl"
 BORDER_PKL              = INTERMEDIATE / "distance_to_border.pkl"
 BANCO_FINAL_PKL         = INTERMEDIATE / "banco_final_to_risk_analysis.pkl"
 
@@ -65,16 +61,12 @@ TMP_PRESSURE            = INTERMEDIATE / "tmp_road_pressure"
 ROAD_OUT                = INTERMEDIATE / "road_pressure"
 FARM_ROAD_PRESSURE_SHP  = ROAD_OUT / "farm_road_pressure_10km.shp"
 
-# Intermediate model/analysis outputs from step 6
-R_PLOTS_DIR             = INTERMEDIATE / "r_plots"
-
 
 def ensure_dirs() -> None:
     """Create all output directories that must exist before the pipeline runs."""
     for d in [
         RESULTS, INTERMEDIATE, LST_DIR,
         TMP_MONTHLY, TMP_PRESSURE, ROAD_OUT,
-        R_PLOTS_DIR,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 

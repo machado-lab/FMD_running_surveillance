@@ -12,11 +12,9 @@ Steps:
     2b Temperature / LST raster extraction
     3a Road animal pressure (heavy — cached on disk)
     3b Spatial network features
-    4  SISBRAVET surveillance data
-    5  Distance to international border
-    6  Biosecurity scores (Epicollect)
-    7  Combine and validate all features
-    8  FMD risk analysis → results/fmd_risk_scored.csv
+    4  Distance to international border
+    5  Combine and validate all features
+    6  FMD risk analysis → results/fmd_risk_scored.csv
 """
 
 import argparse
@@ -42,15 +40,11 @@ STEPS = [
          PIPELINE / "3_1_road_animal_preassure.py"),
     (5,  "Spatial network features",
          PIPELINE / "3_get_spatial_net_features.py"),
-    (6,  "SISBRAVET surveillance data",
-         PIPELINE / "4_load_and_check_sisbravet_data.py"),
-    (7,  "Distance to international border",
+    (6,  "Distance to international border",
          PIPELINE / "5_distance_to_border.py"),
-    (8,  "Biosecurity scores (Epicollect model)",
-         PIPELINE / "6_final_score_cadastro_with_sisbravet_labels.py"),
-    (9,  "Combine and validate all features",
+    (7,  "Combine and validate all features",
          PIPELINE / "7_combine_and_check_data.py"),
-    (10, "FMD risk analysis → results/",
+    (8,  "FMD risk analysis → results/",
          PIPELINE / "8_fmd_risk_analysis.py"),
 ]
 
@@ -108,7 +102,7 @@ def main() -> None:
     if csv_out.exists():
         print(f"  Final output : {csv_out}")
     else:
-        print(f"  WARNING: {csv_out} not found — check step 10 logs.")
+        print(f"  WARNING: {csv_out} not found — check step 8 logs.")
     print("=" * 60 + "\n")
 
 

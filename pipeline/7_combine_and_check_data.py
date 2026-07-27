@@ -18,7 +18,7 @@ from src.paths import (
     INTERMEDIATE,
     CADASTRO_PKL, FARM_DENSITY_PKL, ANIMAL_PRESSURE_PKL,
     DISTANCE_ROADS_PKL, WEATHER_PKL, BORDER_PKL,
-    SISBRAVET_PKL, NETWORK_PKL, BIOSEC_PKL,
+    NETWORK_PKL,
     JAVALI_PKL, SLAUGHTERHOUSE_PKL, BANCO_FINAL_PKL,
     FARM_ROAD_PRESSURE_SHP,
 )
@@ -77,37 +77,9 @@ with open(str(WEATHER_PKL), "rb") as f:
 with open(str(BORDER_PKL), "rb") as f:
     borders_df = pickle.load(f)
 
-#  Load SISBRAVET FMD surveillance data
-if SISBRAVET_PKL.exists():
-    with open(str(SISBRAVET_PKL), "rb") as f:
-        sisbravet_df = pickle.load(f)
-    print("\nSISBRAVET FMD data shape:", sisbravet_df.shape)
-    print("SISBRAVET FMD data columns:", sisbravet_df.columns.tolist()[:15])
-    print(f"SISBRAVET records: {len(sisbravet_df)}")
-    print(f"SISBRAVET species: {sisbravet_df['Espécie'].unique().tolist()}")
-else:
-    print(f"\nWarning: SISBRAVET file not found at {SISBRAVET_PKL}")
-    sisbravet_df = None
-## add the column here easy and safe for nico sanity
-cadastro["CPF_CNPJ_TITULAR"] = cadastro["CPF_CNPJ_TITULAR"].astype(str)
-sisbravet_df["CPF"] = sisbravet_df["CPF"].astype(str)
-cadastro["in_sisbravet"] = cadastro["CPF_CNPJ_TITULAR"].isin(
-    sisbravet_df["CPF"]
-)
-cadastro["in_sisbravet"].value_counts().to_frame()
-
-
 # network
 with open(str(NETWORK_PKL), "rb") as f:
     network_df = pickle.load(f)
-
-# biosecurity
-with open(str(BIOSEC_PKL), "rb") as f:
-    biosecudf = pickle.load(f)
-biosecudf.columns
-
-biosecudf["biosecurity_farm_score"] = biosecudf["risk_score"]
-biosecudf = biosecudf[["COD_PROPRIEDADE_RURAL", "biosecurity_farm_score"]].copy()
 
 # javalies
 with open(str(JAVALI_PKL), "rb") as f:
@@ -162,11 +134,6 @@ combined_df = combined_df.merge(weather_df, on='COD_PROPRIEDADE_RURAL', how='lef
 borders_df = borders_df[["COD_PROPRIEDADE_RURAL", "dist_border_m", "nearest_border_type"]].copy()
 borders_df = borders_df.drop_duplicates(subset=["COD_PROPRIEDADE_RURAL"])
 combined_df = combined_df.merge(borders_df, on='COD_PROPRIEDADE_RURAL', how='left')
-
-# Merge biosecurity data
-biosecudf["COD_PROPRIEDADE_RURAL"] = pd.to_numeric(biosecudf["COD_PROPRIEDADE_RURAL"], errors="coerce").astype("Int64")
-biosecudf = biosecudf.drop_duplicates(subset=["COD_PROPRIEDADE_RURAL"])
-combined_df = combined_df.merge(biosecudf, on="COD_PROPRIEDADE_RURAL", how="left")
 
 # Merge javali risk (municipality-level)
 combined_df["COD_MUNICIPIO_IBGE"] = combined_df["COD_MUNICIPIO_IBGE"].astype(str)

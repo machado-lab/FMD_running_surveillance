@@ -6,7 +6,7 @@
 #   in the state of Rio Grande do Sul (RS), Brazil. Note: the input
 #   dataset is already filtered to FMD-susceptible species in
 #   7_combine_and_check_data.py (Bovinos, Suíno, Caprinos, Bubalinos).
-#       1. Equal-weight risk score  — all components weighted 1/9
+#       1. Equal-weight risk score  — all components weighted 1/8
 #       2. Epidemiologically weighted risk score — literature-grounded weights
 #
 # Input:
@@ -19,7 +19,6 @@
 #   - network_risk_score NaN → median imputation (N printed at runtime)
 #   - fmd_survival_prob_overall: HIGHER = more risk
 #         (FMD virus environmental survival probability, temperature-driven)
-#   - biosecurity_farm_score:   HIGHER = more protected → INVERTED for risk
 #   - dist_border_m:            CLOSER = higher risk    → INVERTED for risk
 #   - road_exposure_risk_raw:   HIGHER exposure = higher risk (direct, no inversion)
 #   - nearest_border_type:      only "dry" + missing    → EXCLUDED
@@ -70,7 +69,6 @@ required_cols = [
     "AREA_PROPRIEDADE",
     "ESPECIE_ANIMAL",
     "QTD_DECLARADA",
-    "in_sisbravet",
     "network_risk_score",
     "n_neighbors_5km",
     "animals_within_5km",
@@ -78,7 +76,6 @@ required_cols = [
     "fmd_survival_prob_overall",
     "dist_border_m",
     "nearest_border_type",
-    "biosecurity_farm_score",
     "javali_risk_smooth_iter",
     "slaughterhouse_risk"
 ]
@@ -88,13 +85,12 @@ assert not missing_cols, f"Missing required columns: {missing_cols}"
 print("\n    FMD susceptible species in dataset:")
 print(combined_df["ESPECIE_ANIMAL"].value_counts().to_string())
 
-# Keep only analysis-relevant columns (avoid leaking IDs like CPF_CNPJ_TITULAR)
+# Keep only analysis-relevant columns
 analysis_cols = [
     "COD_PROPRIEDADE_RURAL",
     "AREA_PROPRIEDADE",
     "ESPECIE_ANIMAL",
     "QTD_DECLARADA",
-    "in_sisbravet",
     "network_risk_score",
     "n_neighbors_5km",
     "animals_within_5km",
@@ -102,7 +98,6 @@ analysis_cols = [
     "fmd_survival_prob_overall",
     "dist_border_m",
     "nearest_border_type",
-    "biosecurity_farm_score",
     "javali_risk_smooth_iter",
     "slaughterhouse_risk",
 ]
@@ -196,7 +191,7 @@ print(f"\n    Final shape after cleaning: {combined_df.shape}")
 # ==============================================================================
 # Each component is stored as a separate column.
 # The sign convention is: HIGHER raw value = HIGHER risk.
-# Columns that violate this (accessibility, border, biosecurity) are
+# Columns that violate this (accessibility, border) are
 # flagged here and inverted AFTER normalization in Section 4.
 #
 # Keeping components separate makes weights trivially editable and
@@ -254,15 +249,7 @@ combined_df['comp_border'] = combined_df['dist_border_m']
 # Source: javali_risk_smooth_iter
 combined_df['comp_wildlife_javali'] = combined_df['javali_risk_smooth_iter']
 
-# --- Component 7: Biosecurity risk (inverse) ---
-# ASSUMPTION: Higher biosecurity_farm_score indicates more protective
-#   measures in place (fencing quality, access control, disinfection
-#   protocols) — i.e. LOWER transmission probability.
-# Direction: HIGHER score = LOWER risk → will be INVERTED in Section 4.
-# Source: biosecurity_farm_score (range ~0.026–0.83)
-combined_df['comp_biosecurity'] = combined_df['biosecurity_farm_score']
-
-# --- Component 8: Epidemiological susceptibility ---
+# --- Component 7: Epidemiological susceptibility ---
 # ASSUMPTION: fmd_survival_prob_overall is the probability that the FMD
 #   virus survives in the ambient environment at the farm's location.
 #   This is computed from local temperature/humidity data (see
@@ -273,7 +260,7 @@ combined_df['comp_biosecurity'] = combined_df['biosecurity_farm_score']
 # Source: fmd_survival_prob_overall (range ~0.48–0.83)
 combined_df['comp_fmdv_survival_prob_overall'] = combined_df['fmd_survival_prob_overall']
 
-# --- Component 9: Slaughterhouse proximity risk ---
+# --- Component 8: Slaughterhouse proximity risk ---
 # ASSUMPTION: Farms closer to slaughterhouses experience higher vehicle
 #   traffic (trucks transporting live animals) and greater fomite/spread
 #   risk. Slaughterhouses are major nodes in the animal movement network
@@ -286,7 +273,7 @@ combined_df['comp_slaughterhouse_risk'] = combined_df['slaughterhouse_risk']
 components = [
     'comp_spatial_density', 'comp_animal_pressure', 'comp_network_risk',
     'comp_road_exposure',         'comp_border',           'comp_wildlife_javali',
-    'comp_biosecurity',           'comp_fmdv_survival_prob_overall',
+    'comp_fmdv_survival_prob_overall',
     'comp_slaughterhouse_risk',
 ]
 print("    Raw risk component statistics:")
@@ -305,7 +292,7 @@ print(combined_df[components].describe().round(4).T.to_string())
 #   For variables where SMALLER raw value = HIGHER risk, we apply
 #       risk_norm = 1 - norm(x)
 #   so that in every normalized column, 1 = maximum risk, 0 = minimum risk.
-#   Affected columns: accessibility, border, biosecurity.
+#   Affected columns: accessibility, border.
 
 print("\n[4] Normalizing risk components to [0, 1] ...")
 
@@ -344,9 +331,6 @@ combined_df['border_risk_norm'] = 1.0 - minmax_norm(combined_df['comp_border'])
 # Wildlife (javali) reservoir risk: higher = higher risk → direct
 combined_df['wildlife_javali_norm'] = minmax_norm(combined_df['comp_wildlife_javali'])
 
-# Biosecurity: HIGHER score = more protected = LOWER risk → INVERT
-combined_df['biosecurity_risk_norm'] = 1.0 - minmax_norm(combined_df['comp_biosecurity'])
-
 # Susceptibility: higher survival prob = higher risk → direct
 combined_df['comp_fmdv_survival_prob_overall_norm'] = minmax_norm(combined_df['comp_fmdv_survival_prob_overall'])
 
@@ -362,7 +346,6 @@ NORM_COLS = [
     'road_exposure_norm',
     'border_risk_norm',
     'wildlife_javali_norm',
-    'biosecurity_risk_norm',
     'comp_fmdv_survival_prob_overall_norm',
     'slaughterhouse_risk_norm',
 ]
@@ -382,12 +365,12 @@ inversion_table = pd.DataFrame({
     'raw_source':            [
         'n_neighbors_5km', 'animals_within_5km', 'network_risk_score',
         'road_exposure_risk_raw', 'dist_border_m', 'javali_risk_smooth_iter',
-        'biosecurity_farm_score', 'fmd_survival_prob_overall',
+        'fmd_survival_prob_overall',
         'slaughterhouse_risk',
     ],
     'direction':             ['direct', 'direct', 'direct',
                               'direct', 'inverted', 'direct',
-                              'inverted', 'direct', 'direct'],
+                              'direct', 'direct'],
     'rationale': [
         'more farms nearby = higher risk',
         'more animals nearby = higher risk',
@@ -395,7 +378,6 @@ inversion_table = pd.DataFrame({
         'higher combined road exposure (flow × decay proximity) = higher risk',
         'closer border = higher risk',
         'higher wild boar risk = higher wildlife reservoir risk',
-        'higher biosecurity = LOWER risk',
         'virus survives longer = higher risk',
         'closer slaughterhouse = higher vehicle traffic risk',
     ],
@@ -433,7 +415,9 @@ print(f"    Equal-weight score — mean: {combined_df['risk_score_equal'].mean()
 # Score 2: Epidemiologically weighted risk score
 # ------------------------------------------------------------------------------
 # Weights are grounded in the FMD epidemiological literature and expert
-# reasoning. Full rationale is provided below. Weights sum to exactly 1.0.
+# reasoning. Full rationale is provided below. The base literature weights
+# below (biosecurity excluded — no Epicollect biosecurity survey component
+# in this pipeline) sum to 0.87 and are renormalized to sum to exactly 1.0.
 #
 # Component                  Weight    Rationale
 # ─────────────────────────────────────────────────────────────────────────────
@@ -451,14 +435,6 @@ print(f"    Equal-weight score — mean: {combined_df['risk_score_equal'].mean()
 #                                     high-connectivity farm can seed outbreaks
 #                                     across the state (Bigras-Poulin et al.
 #                                     2006; Buhnerkempe et al. 2014).
-#
-# biosecurity_risk_norm       0.1300  Biosecurity measures directly reduce
-#                                     per-contact transmission probability
-#                                     (Nöremark et al. 2016). Weight reduced
-#                                     from 0.1730: score variance is near-zero
-#                                     (std = 0.018) in the Epicollect dataset,
-#                                     so a higher weight provides no additional
-#                                     discriminating power across farms.
 #
 # comp_fmdv_survival_prob_overall_norm
 #                             0.1200  Environmental suitability for FMDV
@@ -502,12 +478,11 @@ print(f"    Equal-weight score — mean: {combined_df['risk_score_equal'].mean()
 #                                     limits applicability to a small farm
 #                                     subset (11.9 % of properties).
 #
-# TOTAL                       1.00
+# SUBTOTAL (8 components)     0.87  → renormalized to 1.00 below
 # ─────────────────────────────────────────────────────────────────────────────
-EPI_WEIGHTS = {
+EPI_WEIGHTS_BASE = {
     'animal_pressure_norm':                  0.1900,
     'network_risk_norm':                     0.1748,
-    'biosecurity_risk_norm':                 0.1300,
     'comp_fmdv_survival_prob_overall_norm':  0.1200,
     'border_risk_norm':                      0.1000,
     'road_exposure_norm':                    0.0900,
@@ -515,6 +490,10 @@ EPI_WEIGHTS = {
     'spatial_density_norm':                  0.0700,
     'slaughterhouse_risk_norm':              0.0500,
 }
+
+# Renormalize the base literature weights (sum = 0.87) to sum to 1.0.
+_base_sum   = sum(EPI_WEIGHTS_BASE.values())
+EPI_WEIGHTS = {k: v / _base_sum for k, v in EPI_WEIGHTS_BASE.items()}
 
 # Verify weights sum to 1.0 (important for interpretability)
 weight_sum = sum(EPI_WEIGHTS.values())
@@ -685,7 +664,6 @@ top_50_epi = (
     final_df[
         ['COD_PROPRIEDADE_RURAL', 'risk_score_epi', 'risk_score_equal']
         + NORM_COLS
-        + ['in_sisbravet']
     ]
     .sort_values('risk_score_epi', ascending=False)
     .head(50)
@@ -694,7 +672,7 @@ top_50_epi = (
 
 print("\n    Top 10 farms by epi-weighted risk score:")
 print(top_50_epi[['COD_PROPRIEDADE_RURAL', 'risk_score_epi',
-                   'risk_score_equal', 'in_sisbravet']].head(10).to_string())
+                   'risk_score_equal']].head(10).to_string())
 
 
 # Pairwise Spearman correlation among all normalized components
