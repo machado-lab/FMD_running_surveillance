@@ -1,14 +1,13 @@
 # FMD Risk Surveillance Pipeline
 
 Farm-level Foot-and-Mouth Disease (FMD) risk scoring for Rio Grande do Sul (RS), Brazil.  
-The pipeline integrates spatial, network, and environmental data to produce  
-two composite risk scores per farm: equal-weight and epidemiologically weighted.
+The pipeline integrates spatial, network, and environmental data.
 
 ---
 
 > [!WARNING]
 > **The data in `raw_data/` is fully synthetic (fictitious).**
-> GPS coordinates, names, CPF/CNPJ, and property identifiers have been
+> GPS coordinates, names, CPF/CNPJ, and any other property identifiers have been
 > replaced with randomized values solely to demonstrate that the code
 > runs — **it does not represent real surveillance data** and cannot be
 > used to identify any individual. Public datasets (roads, borders, RS

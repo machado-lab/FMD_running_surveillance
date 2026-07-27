@@ -30,7 +30,7 @@
 #   Heavily commented for reproducibility and publication readiness.
 #   Libraries: pandas, numpy, matplotlib, seaborn only.
 #
-# Author : ncesped
+# Author : Nicolas Cardenas
 # Date   : 2026-04-03
 # ==============================================================================
 
@@ -124,13 +124,6 @@ combined_df['javali_risk_smooth_iter'] = pd.to_numeric(
 
 # --------------------------------------------------------------------------
 # 2b. Impute network_risk_score with the column median
-#
-# ASSUMPTION: NaN means the farm had no recorded live-animal movement
-#   events in the movement database — not that it is risk-free. We use
-#   the median rather than zero, which would systematically under-estimate
-#   risk for farms that are simply absent from the movement registry.
-#   Median imputation is a conservative, widely accepted approach for
-#   missing network data in spatial-epidemiology contexts.
 # --------------------------------------------------------------------------
 network_median = combined_df['network_risk_score'].median()
 n_network_nan  = combined_df['network_risk_score'].isna().sum()
@@ -144,12 +137,6 @@ print(f"    network_risk_score — {n_network_nan:,} NaN ({pct_missing:.1f} %) "
 
 # --------------------------------------------------------------------------
 # 2c. Median-impute remaining numeric columns with small NaN counts
-#     (n_neighbors_5km, animals_within_5km, dist_3_roads_sum_m_div_3,
-#      fmd_survival_prob_overall, dist_border_m, AREA_PROPRIEDADE,
-#      QTD_DECLARADA, javali_risk_smooth_iter)
-#
-#     Median is preferred over mean because several variables
-#     (animals_within_5km, n_neighbors_5km) are right-skewed.
 # --------------------------------------------------------------------------
 cols_to_impute = [
     'n_neighbors_5km',
@@ -172,9 +159,6 @@ for col in cols_to_impute:
 
 # --------------------------------------------------------------------------
 # 2d. Note on nearest_border_type: all non-missing rows have the value "dry"
-#     (confirmed in data inspection). This variable has effectively zero
-#     variation and therefore no discriminatory power. We exclude it from
-#     the risk model. Border risk will be captured by dist_border_m alone.
 # --------------------------------------------------------------------------
 border_type_counts = combined_df['nearest_border_type'].value_counts(dropna=False)
 print(f"\n    nearest_border_type distribution (all rows are 'dry' — EXCLUDED):")
@@ -189,85 +173,30 @@ print(f"\n    Final shape after cleaning: {combined_df.shape}")
 # ==============================================================================
 # SECTION 3 — FEATURE ENGINEERING: RISK COMPONENTS
 # ==============================================================================
-# Each component is stored as a separate column.
-# The sign convention is: HIGHER raw value = HIGHER risk.
-# Columns that violate this (accessibility, border) are
-# flagged here and inverted AFTER normalization in Section 4.
-#
-# Keeping components separate makes weights trivially editable and
-# allows individual components to be audited in the final dataset.
-
 
 
 # --- Component 1: Spatial density risk ---
-# Higher farm count within 5 km = denser local population = more contact
-# opportunities = higher local amplification risk.
-# Source: n_neighbors_5km (number of farms within 5 km radius)
 combined_df['comp_spatial_density'] = combined_df['n_neighbors_5km']
 
 # --- Component 2: Animal pressure risk ---
-# Total number of susceptible animals within 5 km radius.
-# More animals = larger susceptible host pool = higher transmission pressure
-# (Keeling & Rohani, 2008 — mass-action transmission assumption).
-# Source: animals_within_5km
 combined_df['comp_animal_pressure'] = combined_df['animals_within_5km']
 
 # --- Component 3: Network / movement risk ---
-# Captures live-animal movement pathways through trade networks.
-# FMD spreads primarily via movement of infected animals and contaminated
-# vehicles/fomites (Bigras-Poulin et al., 2006). Higher score = more
-# connected farm = faster potential spread.
-# Source: network_risk_score (already median-imputed above)
 combined_df['comp_network_risk'] = combined_df['network_risk_score']
 
 # --- Component 4: Road exposure risk ---
-# ASSUMPTION: Farms near roads with high animal traffic face greater risk of
-#   exposure to fomites carried by livestock transport vehicles. This component
-#   combines animal flow on nearby roads with farm-to-road distance via an
-#   exponential decay (Nigsch et al., 2013; Garner & Lack, 1995; Boklund et
-#   al., 2009). The decay parameter λ = ln(2)/6000 m⁻¹ sets the half-life at
-#   2 km per road segment, consistent with reported vehicle-borne spread zones.
-# Direction: HIGHER value = HIGHER risk → direct (no inversion needed).
-# Source: road_exposure_risk_raw (computed in 7_combine_and_check_data.py)
 combined_df['comp_road_exposure'] = combined_df['road_exposure_risk_raw']
 
 # --- Component 5: Border risk ---
-# ASSUMPTION: Proximity to the international border with Argentina and
-#   Uruguay raises the risk of exotic-strain reintroduction via informal
-#   animal movements, contaminated trucks, or illegal trade (Lyons et al.,
-#   2015). Rio Grande do Sul is Brazil's only state bordering both countries.
-# Direction: SMALLER distance = HIGHER risk  → will be INVERTED in Section 4.
-# Note: nearest_border_type excluded (uniform "dry", no variation).
-# Source: dist_border_m
 combined_df['comp_border'] = combined_df['dist_border_m']
 
 # --- Component 6: Wildlife (javali) reservoir risk ---
-# ASSUMPTION: Higher wild boar (javali) risk increases the probability of
-#   wildlife-mediated FMD introduction and local persistence. This layer
-#   is municipality-level smoothed risk, merged to farms by COD_MUNICIPIO_IBGE.
-# Direction: HIGHER value = HIGHER risk (direct, no inversion needed).
-# Source: javali_risk_smooth_iter
 combined_df['comp_wildlife_javali'] = combined_df['javali_risk_smooth_iter']
 
 # --- Component 7: Epidemiological susceptibility ---
-# ASSUMPTION: fmd_survival_prob_overall is the probability that the FMD
-#   virus survives in the ambient environment at the farm's location.
-#   This is computed from local temperature/humidity data (see
-#   weather_probs_fmd.pkl and plot_fmd_survival_virus_temperature.R).
-#   Higher probability = virus persists longer = greater risk of local
-#   transmission and amplification (Sanson, 1994).
-# Direction: HIGHER value = HIGHER risk (direct, no inversion needed).
-# Source: fmd_survival_prob_overall (range ~0.48–0.83)
 combined_df['comp_fmdv_survival_prob_overall'] = combined_df['fmd_survival_prob_overall']
 
 # --- Component 8: Slaughterhouse proximity risk ---
-# ASSUMPTION: Farms closer to slaughterhouses experience higher vehicle
-#   traffic (trucks transporting live animals) and greater fomite/spread
-#   risk. Slaughterhouses are major nodes in the animal movement network
-#   and can amplify FMD spread via contaminated vehicles or returned
-#   animals. Higher score = closer proximity = higher risk.
-# Direction: HIGHER value = HIGHER risk (direct, no inversion needed).
-# Source: slaughterhouse_risk
 combined_df['comp_slaughterhouse_risk'] = combined_df['slaughterhouse_risk']
 
 components = [
@@ -283,16 +212,6 @@ print(combined_df[components].describe().round(4).T.to_string())
 # ==============================================================================
 # SECTION 4 — NORMALIZATION: MIN-MAX SCALING TO [0, 1]
 # ==============================================================================
-# Formula:
-#   norm(x) = (x - x_min) / (x_max - x_min)
-#
-# This maps each component independently to [0, 1].
-#
-# Inversion rule:
-#   For variables where SMALLER raw value = HIGHER risk, we apply
-#       risk_norm = 1 - norm(x)
-#   so that in every normalized column, 1 = maximum risk, 0 = minimum risk.
-#   Affected columns: accessibility, border.
 
 print("\n[4] Normalizing risk components to [0, 1] ...")
 
@@ -393,10 +312,7 @@ print(inversion_table.to_string(index=False))
 # ------------------------------------------------------------------------------
 # Score 1: Equal-weight risk score
 # ------------------------------------------------------------------------------
-# Each of the 8 components receives equal weight = 1/8 = 0.125.
-# This is the simplest possible aggregation and serves as a reference baseline
-# for comparing against the epidemiologically informed score.
-# ------------------------------------------------------------------------------
+
 N_COMPONENTS  = len(NORM_COLS)
 EQUAL_WEIGHT  = 1.0 / N_COMPONENTS
 EQUAL_WEIGHTS = {col: EQUAL_WEIGHT for col in NORM_COLS}
@@ -414,72 +330,6 @@ print(f"    Equal-weight score — mean: {combined_df['risk_score_equal'].mean()
 # ------------------------------------------------------------------------------
 # Score 2: Epidemiologically weighted risk score
 # ------------------------------------------------------------------------------
-# Weights are grounded in the FMD epidemiological literature and expert
-# reasoning. Full rationale is provided below. The base literature weights
-# below (biosecurity excluded — no Epicollect biosecurity survey component
-# in this pipeline) sum to 0.87 and are renormalized to sum to exactly 1.0.
-#
-# Component                  Weight    Rationale
-# ─────────────────────────────────────────────────────────────────────────────
-# animal_pressure_norm        0.1900  Animal density drives direct contact
-#                                     transmission — dominant pathway at local
-#                                     scale. Reduced from 0.2162: prior weight
-#                                     created disproportionate ranking influence
-#                                     (sensitivity: only 74 % top-500 stability
-#                                     at ±20 % perturbation).
-#                                     (Keeling & Rohani 2008; Kao 2002)
-#
-# network_risk_norm           0.1748  Live-animal movement is the principal
-#                                     long-distance spread mechanism for FMD.
-#                                     High leverage even if rare: a single
-#                                     high-connectivity farm can seed outbreaks
-#                                     across the state (Bigras-Poulin et al.
-#                                     2006; Buhnerkempe et al. 2014).
-#
-# comp_fmdv_survival_prob_overall_norm
-#                             0.1200  Environmental suitability for FMDV
-#                                     survival (temperature-driven biphasic
-#                                     decay). Increased from 0.0865: good
-#                                     observed variance (std = 0.167) across
-#                                     RS municipalities; modulates both entry
-#                                     and persistence risk (Sanson 1994).
-#
-# border_risk_norm            0.1000  Proximity to Argentina/Uruguay is the
-#                                     primary exotic-strain re-introduction
-#                                     pathway for RS — the only Brazilian state
-#                                     bordering both countries (Lyons et al.
-#                                     2015). Increased from 0.0865 to reflect
-#                                     the unique geopolitical exposure of RS.
-#
-# road_exposure_norm          0.0900  Combined road exposure (animal flow ×
-#                                     exponential distance decay). Increased
-#                                     from 0.0696 to reflect the new composite
-#                                     formulation, which carries more information
-#                                     than the previous simple distance metric
-#                                     (Nigsch et al. 2013; Garner & Lack 1995).
-#
-# wildlife_javali_norm        0.0752  Wild boar (javali) reservoir risk —
-#                                     municipality-level smoothed index.
-#                                     Highest observed score variance (std = 0.338)
-#                                     across components; weight held fixed to
-#                                     preserve the epidemiological hierarchy
-#                                     while respecting the coarser spatial
-#                                     resolution of this input.
-#
-# spatial_density_norm        0.0700  Farm count within 5 km. Increased from
-#                                     0.0602; partially correlated with
-#                                     animal_pressure but captures shared
-#                                     infrastructure and equipment risk not
-#                                     reflected in head counts.
-#
-# slaughterhouse_risk_norm    0.0500  Slaughterhouse proximity. Reduced from
-#                                     0.0600: overlap with road_exposure and
-#                                     network components; 5 km threshold
-#                                     limits applicability to a small farm
-#                                     subset (11.9 % of properties).
-#
-# SUBTOTAL (8 components)     0.87  → renormalized to 1.00 below
-# ─────────────────────────────────────────────────────────────────────────────
 EPI_WEIGHTS_BASE = {
     'animal_pressure_norm':                  0.1900,
     'network_risk_norm':                     0.1748,
@@ -525,20 +375,6 @@ print(f"\n    Spearman r(equal, epi) = {r_equal_epi:.4f}")
 # ==============================================================================
 # SECTION 6 — SENSITIVITY ANALYSIS
 # ==============================================================================
-# Purpose:
-#   Assess how much the top-farm ranking changes when each epidemiological
-#   weight is nudged ±20 % relative to its base value.
-#
-# Method:
-#   For each of the 8 components, two perturbed weight dictionaries are
-#   created (one +20 %, one −20 %). The adjusted weight is renormalised so
-#   the total always equals 1.0. The resulting 16 perturbed scores are
-#   compared to the base epi-weighted score via:
-#     (a) Spearman rank correlation (whole-population metric)
-#     (b) Top-500 overlap percentage (priority-list stability metric)
-#
-#   If correlations remain > 0.99 and overlap > 95 %, the score is
-#   considered robust to expert disagreement on weights.
 
 print("\n[6] Running sensitivity analysis (±20 % weight perturbation) ...")
 
@@ -627,14 +463,6 @@ print(f"    Min Spearman r: {min_corr:.5f}")
 # ==============================================================================
 # SECTION 7 — FINAL DATAFRAME
 # ==============================================================================
-# The final dataframe contains ALL farms in the combined dataset
-# (already filtered to FMD-susceptible species upstream) with:
-#   - All analysis columns (subset of the original dataset)
-#   - All raw risk components (comp_*)
-#   - All normalized components (*_norm)
-#   - risk_score_equal
-#   - risk_score_epi
-# combined_df already contains everything — just take a copy for safety
 final_df = combined_df.copy()
 
 
