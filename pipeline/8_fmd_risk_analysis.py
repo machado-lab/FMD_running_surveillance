@@ -13,7 +13,17 @@
 #   intermediate/banco_final_to_risk_analysis.pkl
 #
 # Outputs (all saved to results/):
-#   fmd_risk_scored.csv            — full scored dataset (primary deliverable)
+#   fmd_risk_scored.csv / .pkl      — full scored dataset (primary deliverable)
+#   top50_high_risk_farms.csv       — top 50 farms by epi-weighted score
+#   component_weights.csv           — weight table for reproducibility
+#   risk_score_summary_stats.csv    — summary statistics
+#   sensitivity_analysis.csv        — rank stability per perturbed weight
+#   sensitivity_spearman_corr.csv   — full Spearman correlation matrix
+#   plot1_risk_score_histograms.png
+#   plot2_equal_vs_epi_scores.png
+#   plot3_components_vs_epi_score.png
+#   plot5_sensitivity_heatmap.png
+#   plot7_component_correlation.png
 #
 # Key assumptions (documented inline at each step):
 #   - network_risk_score NaN → median imputation (N printed at runtime)
@@ -38,6 +48,10 @@ import sys
 import os
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')            # non-interactive backend — safe for saving
+import matplotlib.pyplot as plt
+import seaborn as sns
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -67,11 +81,11 @@ print(f"    Columns          : {list(combined_df.columns)}")
 required_cols = [
     "COD_PROPRIEDADE_RURAL",
     "AREA_PROPRIEDADE",
-    "ESPECIE_ANIMAL",
-    "QTD_DECLARADA",
+    "dominant_species",
+    "QTD_DECLARADA_total",
     "network_risk_score",
     "n_neighbors_5km",
-    "animals_within_5km",
+    "animal_pressure_weighted_10km",
     "road_exposure_risk_raw",
     "fmd_survival_prob_overall",
     "dist_border_m",
@@ -82,18 +96,18 @@ required_cols = [
 missing_cols = [c for c in required_cols if c not in combined_df.columns]
 assert not missing_cols, f"Missing required columns: {missing_cols}"
 
-print("\n    FMD susceptible species in dataset:")
-print(combined_df["ESPECIE_ANIMAL"].value_counts().to_string())
+print("\n    FMD susceptible species (dominant per farm) in dataset:")
+print(combined_df["dominant_species"].value_counts().to_string())
 
-# Keep only analysis-relevant columns
+# Keep only analysis-relevant columns (avoid leaking IDs like CPF_CNPJ_TITULAR)
 analysis_cols = [
     "COD_PROPRIEDADE_RURAL",
     "AREA_PROPRIEDADE",
-    "ESPECIE_ANIMAL",
-    "QTD_DECLARADA",
+    "dominant_species",
+    "QTD_DECLARADA_total",
     "network_risk_score",
     "n_neighbors_5km",
-    "animals_within_5km",
+    "animal_pressure_weighted_10km",
     "road_exposure_risk_raw",
     "fmd_survival_prob_overall",
     "dist_border_m",
@@ -140,12 +154,12 @@ print(f"    network_risk_score — {n_network_nan:,} NaN ({pct_missing:.1f} %) "
 # --------------------------------------------------------------------------
 cols_to_impute = [
     'n_neighbors_5km',
-    'animals_within_5km',
+    'animal_pressure_weighted_10km',
     'road_exposure_risk_raw',
     'fmd_survival_prob_overall',
     'dist_border_m',
     'AREA_PROPRIEDADE',
-    'QTD_DECLARADA',
+    'QTD_DECLARADA_total',
     'javali_risk_smooth_iter',
     'slaughterhouse_risk',
 ]
@@ -179,7 +193,12 @@ print(f"\n    Final shape after cleaning: {combined_df.shape}")
 combined_df['comp_spatial_density'] = combined_df['n_neighbors_5km']
 
 # --- Component 2: Animal pressure risk ---
-combined_df['comp_animal_pressure'] = combined_df['animals_within_5km']
+# Species-weighted sum of FMD-susceptible headcounts within 10 km true
+# geodesic distance (swine weighted 50x cattle/sheep/goat/buffalo — see
+# SPECIES_WEIGHTS in pipeline/3_get_spatial_net_features.py). More (weighted)
+# animals = larger effective susceptible host pool = higher transmission
+# pressure (Keeling & Rohani, 2008 — mass-action transmission assumption).
+combined_df['comp_animal_pressure'] = combined_df['animal_pressure_weighted_10km']
 
 # --- Component 3: Network / movement risk ---
 combined_df['comp_network_risk'] = combined_df['network_risk_score']
@@ -282,7 +301,7 @@ for col in NORM_COLS:
 inversion_table = pd.DataFrame({
     'component_norm':        NORM_COLS,
     'raw_source':            [
-        'n_neighbors_5km', 'animals_within_5km', 'network_risk_score',
+        'n_neighbors_5km', 'animal_pressure_weighted_10km', 'network_risk_score',
         'road_exposure_risk_raw', 'dist_border_m', 'javali_risk_smooth_iter',
         'fmd_survival_prob_overall',
         'slaughterhouse_risk',
@@ -303,6 +322,18 @@ inversion_table = pd.DataFrame({
 })
 print("\n    Component direction table:")
 print(inversion_table.to_string(index=False))
+
+# Human-friendly labels for plots and tables
+NICE_LABELS = {
+    'spatial_density_norm': 'Spatial Density (norm.)',
+    'animal_pressure_norm': 'Animal Pressure (norm.)',
+    'network_risk_norm': 'Network / Movement Risk (norm.)',
+    'road_exposure_norm': 'Road Exposure Risk (norm.)',
+    'border_risk_norm': 'Border Proximity Risk (norm., inverted)',
+    'wildlife_javali_norm': 'Wild Boar (Javali) Risk (norm.)',
+    'comp_fmdv_survival_prob_overall_norm': 'FMDV Survival Suitability (norm.)',
+    'slaughterhouse_risk_norm':             'Slaughterhouse Proximity Risk (norm.)',
+}
 
 
 # ==============================================================================
@@ -330,6 +361,76 @@ print(f"    Equal-weight score — mean: {combined_df['risk_score_equal'].mean()
 # ------------------------------------------------------------------------------
 # Score 2: Epidemiologically weighted risk score
 # ------------------------------------------------------------------------------
+# Weights are grounded in the FMD epidemiological literature and expert
+# reasoning. Full rationale is provided below.
+#
+# The biosecurity component (base weight 0.13) has been removed.
+# The eight surviving literature weights below sum to 0.87; they are rescaled
+# (divided by 0.87) so the epidemiological weights again sum to exactly 1.0,
+# preserving the relative epidemiological hierarchy among the eight components.
+#
+# Component                  Weight    Rationale
+# ─────────────────────────────────────────────────────────────────────────────
+# animal_pressure_norm        0.1900  Animal density drives direct contact
+#                                     transmission — dominant pathway at local
+#                                     scale. Reduced from 0.2162: prior weight
+#                                     created disproportionate ranking influence
+#                                     (sensitivity: only 74 % top-1000 stability
+#                                     at ±20 % perturbation).
+#                                     (Keeling & Rohani 2008; Kao 2002)
+#
+# network_risk_norm           0.1748  Live-animal movement is the principal
+#                                     long-distance spread mechanism for FMD.
+#                                     High leverage even if rare: a single
+#                                     high-connectivity farm can seed outbreaks
+#                                     across the state (Bigras-Poulin et al.
+#                                     2006; Buhnerkempe et al. 2014).
+#
+# comp_fmdv_survival_prob_overall_norm
+#                             0.1200  Environmental suitability for FMDV
+#                                     survival (temperature-driven biphasic
+#                                     decay). Increased from 0.0865: good
+#                                     observed variance (std = 0.167) across
+#                                     RS municipalities; modulates both entry
+#                                     and persistence risk (Sanson 1994).
+#
+# border_risk_norm            0.1000  Proximity to Argentina/Uruguay is the
+#                                     primary exotic-strain re-introduction
+#                                     pathway for RS — the only Brazilian state
+#                                     bordering both countries (Lyons et al.
+#                                     2015). Increased from 0.0865 to reflect
+#                                     the unique geopolitical exposure of RS.
+#
+# road_exposure_norm          0.0900  Combined road exposure (animal flow ×
+#                                     exponential distance decay). Increased
+#                                     from 0.0696 to reflect the new composite
+#                                     formulation, which carries more information
+#                                     than the previous simple distance metric
+#                                     (Nigsch et al. 2013; Garner & Lack 1995).
+#
+# wildlife_javali_norm        0.0752  Wild boar (javali) reservoir risk —
+#                                     municipality-level smoothed index.
+#                                     Highest observed score variance (std = 0.338)
+#                                     across components; weight held fixed to
+#                                     preserve the epidemiological hierarchy
+#                                     while respecting the coarser spatial
+#                                     resolution of this input.
+#
+# spatial_density_norm        0.0700  Farm count within 5 km. Increased from
+#                                     0.0602; partially correlated with
+#                                     animal_pressure but captures shared
+#                                     infrastructure and equipment risk not
+#                                     reflected in head counts.
+#
+# slaughterhouse_risk_norm    0.0500  Slaughterhouse proximity. Reduced from
+#                                     0.0600: overlap with road_exposure and
+#                                     network components; 5 km threshold
+#                                     limits applicability to a small farm
+#                                     subset (11.9 % of properties).
+#
+# SUBTOTAL (8 components)     0.87  → renormalized to 1.00 below
+# ─────────────────────────────────────────────────────────────────────────────
+# Base literature weights WITHOUT biosecurity (sum = 0.87).
 EPI_WEIGHTS_BASE = {
     'animal_pressure_norm':                  0.1900,
     'network_risk_norm':                     0.1748,
@@ -379,7 +480,7 @@ print(f"\n    Spearman r(equal, epi) = {r_equal_epi:.4f}")
 print("\n[6] Running sensitivity analysis (±20 % weight perturbation) ...")
 
 PERTURBATION = 0.20     # relative perturbation magnitude
-TOP_N_FARMS  = 500      # number of top farms to track for rank stability
+TOP_N_FARMS  = 1000     # number of top farms to track for rank stability
 
 # Collect all score variants in a dict: label → pd.Series
 sensitivity_scores = {
@@ -458,6 +559,11 @@ min_corr    = stability_df['spearman_r_vs_epi'].min()
 print(f"\n    Overlap range : {min_overlap:.1f} % – {max_overlap:.1f} %")
 print(f"    Min Spearman r: {min_corr:.5f}")
 
+# Save sensitivity outputs
+stability_df.to_csv(str(OUTPUT_DIR / 'sensitivity_analysis.csv'), index=False)
+corr_matrix.round(5).to_csv(str(OUTPUT_DIR / 'sensitivity_spearman_corr.csv'))
+print("    Sensitivity tables saved.")
+
 
 
 # ==============================================================================
@@ -502,6 +608,7 @@ print("\n    Top 10 farms by epi-weighted risk score:")
 print(top_50_epi[['COD_PROPRIEDADE_RURAL', 'risk_score_epi',
                    'risk_score_equal']].head(10).to_string())
 
+top_50_epi.to_csv(str(OUTPUT_DIR / 'top50_high_risk_farms.csv'), index=False)
 
 # Pairwise Spearman correlation among all normalized components
 component_corr = final_df[NORM_COLS].corr(method='spearman')
@@ -510,16 +617,206 @@ print(component_corr.round(3).to_string())
 
 
 # ==============================================================================
-# SECTION 9 — SAVE OUTPUTS
+# SECTION 9 — VISUALIZATIONS
+# ==============================================================================
+sns.set_theme(style='whitegrid', font_scale=1.1)
+
+# --------------------------------------------------------------------------
+# Plot 1: Side-by-side histograms of both risk scores
+# --------------------------------------------------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, col, colour, title in [
+    (axes[0], 'risk_score_equal', 'steelblue',
+     'Equal-Weight FMD Risk Score\nDistribution'),
+    (axes[1], 'risk_score_epi',   'darkorange',
+     'Epidemiologically Weighted FMD Risk Score\nDistribution'),
+]:
+    ax.hist(final_df[col], bins=80, color=colour, edgecolor='none', alpha=0.85)
+    ax.axvline(final_df[col].mean(),   color='red',    linestyle='--',
+               linewidth=1.5, label=f"Mean = {final_df[col].mean():.3f}")
+    ax.axvline(final_df[col].median(), color='black',  linestyle=':',
+               linewidth=1.5, label=f"Median = {final_df[col].median():.3f}")
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel('Risk Score (0 – 1)', fontsize=11)
+    ax.set_ylabel('Number of Farms',    fontsize=11)
+    ax.legend(fontsize=9)
+
+plt.tight_layout()
+plt.savefig(str(OUTPUT_DIR / 'plot1_risk_score_histograms.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("    Plot 1 saved: risk score histograms")
+
+# --------------------------------------------------------------------------
+# Plot 2: Equal-weight vs epi-weight scatter
+# --------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(9, 7))
+
+ax.scatter(
+    final_df['risk_score_equal'], final_df['risk_score_epi'],
+    c='steelblue', alpha=0.25, s=3, linewidths=0, rasterized=True,
+)
+
+# Reference diagonal (equal = epi)
+lims = [
+    min(final_df['risk_score_equal'].min(), final_df['risk_score_epi'].min()),
+    max(final_df['risk_score_equal'].max(), final_df['risk_score_epi'].max()),
+]
+ax.plot(lims, lims, 'k--', linewidth=0.8, alpha=0.5, label='y = x (reference)')
+
+ax.set_xlabel('Equal-Weight Risk Score', fontsize=12)
+ax.set_ylabel('Epi-Weighted Risk Score', fontsize=12)
+ax.set_title(
+    f'Equal-Weight vs Epi-Weighted Risk Scores\nSpearman r = {r_equal_epi:.4f}',
+    fontsize=12
+)
+ax.legend(fontsize=9)
+
+plt.tight_layout()
+plt.savefig(str(OUTPUT_DIR / 'plot2_equal_vs_epi_scores.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("    Plot 2 saved: equal vs epi score scatter")
+
+# --------------------------------------------------------------------------
+# Plot 3: Top-4 highest-weight components vs epi risk score
+#         (subsampled to 10,000 points for readability)
+# --------------------------------------------------------------------------
+top_components = sorted(
+    EPI_WEIGHTS.items(), key=lambda x: x[1], reverse=True
+)[:4]
+scatter_vars = [
+    (col, f"{NICE_LABELS.get(col, col)} (w={w:.3f})")
+    for col, w in top_components
+]
+
+rng = np.random.default_rng(42)
+sample_idx = rng.choice(len(final_df), size=min(10_000, len(final_df)), replace=False)
+sample     = final_df.iloc[sample_idx].copy()
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+axes = axes.flatten()
+
+for i, (col, label) in enumerate(scatter_vars):
+    axes[i].scatter(
+        sample[col], sample['risk_score_epi'],
+        c='steelblue', alpha=0.35, s=5, linewidths=0,
+    )
+    m, b = np.polyfit(sample[col], sample['risk_score_epi'], 1)
+    x_line = np.linspace(sample[col].min(), sample[col].max(), 200)
+    axes[i].plot(x_line, m * x_line + b, color='black',
+                 linewidth=1.5, linestyle='-', alpha=0.7,
+                 label=f'Linear fit (r²={np.corrcoef(sample[col], sample["risk_score_epi"])[0,1]**2:.3f})')
+    axes[i].set_xlabel(label,                   fontsize=10)
+    axes[i].set_ylabel('Epi-Weighted Risk Score', fontsize=10)
+    axes[i].set_title(f'{label}\nvs Epi Risk Score',   fontsize=10)
+    axes[i].legend(fontsize=8)
+
+plt.suptitle(
+    'Key Risk Components vs Epi-Weighted Score\n(10,000 farm random sample)',
+    fontsize=13, y=1.01
+)
+plt.tight_layout()
+plt.savefig(str(OUTPUT_DIR / 'plot3_components_vs_epi_score.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("    Plot 3 saved: component scatter plots")
+
+# --------------------------------------------------------------------------
+# Plot 5: Sensitivity analysis — Spearman correlation heatmap
+# --------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(16, 13))
+
+sns.heatmap(
+    corr_matrix,
+    annot=True,
+    fmt='.3f',
+    cmap='RdYlGn',
+    vmin=0.0,
+    vmax=1.0,
+    ax=ax,
+    linewidths=0.4,
+    annot_kws={'size': 7},
+    square=True,
+    cbar_kws={'label': 'Spearman correlation'}
+)
+
+ax.set_title(
+    'Spearman Correlations: Base vs ±20 % Perturbed Risk Scores\n'
+    '(Sensitivity Analysis - higher = more robust to weight changes)',
+    fontsize=12
+)
+ax.set_xlabel('Scenario')
+ax.set_ylabel('Scenario')
+
+plt.xticks(rotation=45, ha='right', fontsize=7)
+plt.yticks(rotation=0, fontsize=7)
+plt.tight_layout()
+plt.savefig(str(OUTPUT_DIR / 'plot5_sensitivity_heatmap.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("    Plot 5 saved: sensitivity heatmap")
+
+# --------------------------------------------------------------------------
+# Plot 7: Spearman correlation matrix of normalized components
+# --------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(15, 15))
+sns.heatmap(
+    component_corr,
+    annot=True, fmt='.2f',
+    cmap='coolwarm', center=0,
+    vmin=-1, vmax=1,
+    ax=ax, linewidths=0.5,
+    annot_kws={'size': 14},
+    square=True,
+)
+tick_labels = [NICE_LABELS.get(c, c) for c in component_corr.columns]
+ax.set_xticklabels(tick_labels, rotation=40, ha='right', fontsize=9)
+ax.set_yticklabels(tick_labels, rotation=0,             fontsize=9)
+ax.set_title('Spearman Correlation Among Normalised Risk Components', fontsize=16)
+plt.tight_layout()
+plt.savefig(str(OUTPUT_DIR / 'plot7_component_correlation.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print("    Plot 7 saved: component correlation heatmap")
+
+
+# ==============================================================================
+# SECTION 10 — SAVE OUTPUTS
 # ==============================================================================
 
 # Drop the quartile label before saving (easy to recompute; avoids Categorical dtype)
 final_df_to_save = final_df.drop(columns=['risk_quartile_epi'])
 
+# 10a. Full scored dataframe — pickle
+pkl_path = str(OUTPUT_DIR / 'fmd_risk_scored.pkl')
+final_df_to_save.to_pickle(pkl_path)
+print(f"     Saved pickle : {pkl_path}  ({len(final_df_to_save):,} rows × "
+      f"{final_df_to_save.shape[1]} cols)")
+
+# 10b. Full scored dataframe — CSV
 csv_path = str(OUTPUT_DIR / 'fmd_risk_scored.csv')
 final_df_to_save.to_csv(csv_path, index=False)
-print(f"     Saved CSV    : {csv_path}  ({len(final_df_to_save):,} rows × "
-      f"{final_df_to_save.shape[1]} cols)")
+print(f"     Saved CSV    : {csv_path}")
+
+# 10c. Summary statistics table
+summary_stats = (
+    final_df_to_save[['risk_score_equal', 'risk_score_epi'] + NORM_COLS]
+    .describe().T.round(4)
+)
+summary_stats.to_csv(str(OUTPUT_DIR / 'risk_score_summary_stats.csv'))
+print("     Saved: risk_score_summary_stats.csv")
+
+# 10d. Component weight table (for full reproducibility)
+weight_table = pd.DataFrame([
+    {
+        'component_norm':     col,
+        'raw_source':         inversion_table.set_index('component_norm').loc[col, 'raw_source'],
+        'direction':          inversion_table.set_index('component_norm').loc[col, 'direction'],
+        'equal_weight':       round(EQUAL_WEIGHT, 5),
+        'epi_weight':         EPI_WEIGHTS[col],
+        'epi_vs_equal_ratio': round(EPI_WEIGHTS[col] / EQUAL_WEIGHT, 3),
+    }
+    for col in NORM_COLS
+])
+weight_table.to_csv(str(OUTPUT_DIR / 'component_weights.csv'), index=False)
+print("     Saved: component_weights.csv")
 
 # List all files written to the output folder
 print("\n    Files in output directory:")

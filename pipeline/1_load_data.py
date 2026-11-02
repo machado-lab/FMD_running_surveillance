@@ -79,12 +79,12 @@ GTAS_COMMON_COLS = [
     "COD_MUN_IBGE_ORIGEM", "LOCALIDADE_ORIGEM",
     "LATITUDE_DEC_ORIGEM", "LONGITUDE_DEC_ORIGEM",
     "PROP_RURAL_ORIGEM", "COD_PROPRIEDADE_ORIGEM", "PRODUTOR_ORIGEM",
-    "TIPO_PRODUTOR_ORIGEM", "ESFERA_ESTAB_ORIGEM",
+    "CPF_CNPJ_ORIGEM", "TIPO_PRODUTOR_ORIGEM", "ESFERA_ESTAB_ORIGEM",
     "UF_DESTINO", "COORD_REGIONAL_DESTINO", "IDA_DESTINO", "MUNICIPIO_DESTINO",
     "COD_MUN_IBGE_DESTINO", "LOCALIDADE_DESTINO",
     "LATITUDE_DEC_DESTINO", "LONGITUDE_DEC_DESTINO",
     "PROP_RURAL_DESTINO", "COD_PROPRIEDADE_DESTINO", "PRODUTOR_DESTINO",
-    "TIPO_PRODUTOR_DESTINO", "ESFERA_ESTAB_DESTINO",
+    "CPF_CNPJ_DESTINO", "TIPO_PRODUTOR_DESTINO", "ESFERA_ESTAB_DESTINO",
 ]
 
 
@@ -167,26 +167,56 @@ if __name__ == "__main__":
         df_all["DATA_DECLARACAO"], errors="coerce", dayfirst=True
     )
 
-    # Keep only the latest declaration per property
+    # FMD-susceptible species kept in cadastro.pkl. Poultry (HPAI_SPECIES) is
+    # filtered out entirely here — no consumer of cadastro.pkl in the active
+    # FMD pipeline expects poultry rows to be present.
+    FMD_SPECIES = ["Bovinos", "Ovino", "Suíno", "Caprinos", "Bubalinos"]
+    HPAI_SPECIES = ["Galinha", "Pato", "Peru", "Galinha de Angola"]  # not retained
+
+    df_all = df_all[df_all["ESPECIE_ANIMAL"].isin(FMD_SPECIES)]
+
+    # Keep only the latest declaration per farm-species combination (NOT per
+    # farm alone — a farm can legitimately declare more than one FMD-
+    # susceptible species, e.g. cattle and pigs, and both must be kept).
+    # Collapsing by farm alone would silently discard every species but the
+    # single most-recently-declared one.
     df_latest = (
         df_all.sort_values("DATA_DECLARACAO")
-        .groupby("COD_PROPRIEDADE_RURAL", as_index=False)
+        .groupby(["COD_PROPRIEDADE_RURAL", "ESPECIE_ANIMAL"], as_index=False)
         .tail(1)
         .reset_index(drop=True)
     )
 
-    df_latest = df_latest[[
+    df_latest2 = df_latest[[
         "COD_MUNICIPIO_IBGE",
         "COD_PROPRIEDADE_RURAL", "AREA_PROPRIEDADE",
-        "LATITUDE_DECIMAL", "LONGITUDE_DECIMAL",
+        "LATITUDE_DECIMAL", "LONGITUDE_DECIMAL", "CPF_CNPJ_TITULAR",
         "ESPECIE_ANIMAL", "QTD_DECLARADA",
-    ]]
+    ]].copy()
 
-    especies_of_interests = [
-        "Bovinos", "Ovino", "Suíno", "Caprinos", "Bubalinos",
-        "Galinha", "Pato", "Peru", "Galinha de Angola",
-    ]
-    df_latest2 = df_latest[df_latest["ESPECIE_ANIMAL"].isin(especies_of_interests)]
+    # dominant_species: the FMD species with the largest declared headcount
+    # at that farm (ties broken by FMD_SPECIES list order, for
+    # reproducibility). Used downstream wherever a farm needs a single
+    # species label even though the farm itself may have multiple species rows.
+    species_rank = {s: i for i, s in enumerate(FMD_SPECIES)}
+    df_latest2["_species_rank"] = df_latest2["ESPECIE_ANIMAL"].map(species_rank)
+    dominant = (
+        df_latest2.sort_values(["QTD_DECLARADA", "_species_rank"], ascending=[False, True])
+        .groupby("COD_PROPRIEDADE_RURAL", as_index=False)
+        .first()[["COD_PROPRIEDADE_RURAL", "ESPECIE_ANIMAL"]]
+        .rename(columns={"ESPECIE_ANIMAL": "dominant_species"})
+    )
+    n_species = (
+        df_latest2.groupby("COD_PROPRIEDADE_RURAL")["ESPECIE_ANIMAL"]
+        .nunique()
+        .rename("n_fmd_species")
+        .reset_index()
+    )
+    df_latest2 = (
+        df_latest2.drop(columns="_species_rank")
+        .merge(dominant, on="COD_PROPRIEDADE_RURAL", how="left")
+        .merge(n_species, on="COD_PROPRIEDADE_RURAL", how="left")
+    )
 
     # ----------------------------------------------------------------
     # 2. Movements (GTAS) — all species
@@ -218,4 +248,9 @@ if __name__ == "__main__":
 
     print(f"\nmovements2 saved: {len(movements2):,} rows → {MOVEMENTS_PKL}")
     print(movements2["species_group"].value_counts().to_string())
-    print(f"\ncadastro saved  : {len(df_latest2):,} rows → {CADASTRO_PKL}")
+
+    n_farms = df_latest2["COD_PROPRIEDADE_RURAL"].nunique()
+    n_multi = (df_latest2["n_fmd_species"] > 1).groupby(df_latest2["COD_PROPRIEDADE_RURAL"]).first().sum()
+    print(f"\ncadastro saved  : {len(df_latest2):,} rows, {n_farms:,} unique farms "
+          f"({n_multi:,} farms with >1 declared FMD species, "
+          f"{n_multi / n_farms:.1%}) → {CADASTRO_PKL}")

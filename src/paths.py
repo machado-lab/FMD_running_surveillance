@@ -32,6 +32,12 @@ CADASTRO_DIR    = RAW_DATA / "cadastro"
 GTAS_DIR        = RAW_DATA / "gtas"
 JAVALI_DIR      = RAW_DATA / "javali_data"
 ROADS_SHP       = RAW_DATA / "roads" / "roads_rs_major.shp"
+# Full road network (every drivable OSM highway class, not just major roads).
+# Built once by pipeline/3_0_download_full_roads.py (see that script's header
+# for why it needs a separate Python environment). roads_rs_major.shp above
+# is left in place untouched, for reference/comparison.
+ROADS_FULL_SHP  = RAW_DATA / "roads" / "roads_rs_full.shp"
+OSM_DIR         = RAW_DATA / "osm"
 RS_BOUNDARY_SHP = RAW_DATA / "rs_boundary_ibge" / "RS_UF_2024.shp"
 BORDER_DIR      = RAW_DATA / "border"
 HYDRO_DIR       = RAW_DATA / "hydro"
@@ -61,12 +67,20 @@ TMP_PRESSURE            = INTERMEDIATE / "tmp_road_pressure"
 ROAD_OUT                = INTERMEDIATE / "road_pressure"
 FARM_ROAD_PRESSURE_SHP  = ROAD_OUT / "farm_road_pressure_10km.shp"
 
+# Full-road-network variants — renamed relative to the major-roads-only
+# caches above so that old caches (built from a different road network) are
+# never silently reused for the full network.
+GRAPH_RAW_CACHE_FULL    = INTERMEDIATE / "graph_rs_roads_full.pkl"
+GRAPH_SIMP_CACHE_FULL   = INTERMEDIATE / "graph_rs_roads_full_simplified.pkl"
+ROUTE_CACHE_FULL        = INTERMEDIATE / "routes_roads_full_cache.pkl"
+TMP_PRESSURE_FULL       = INTERMEDIATE / "tmp_road_pressure_full"  # edge_wkt keys change with the new network
+
 
 def ensure_dirs() -> None:
     """Create all output directories that must exist before the pipeline runs."""
     for d in [
         RESULTS, INTERMEDIATE, LST_DIR,
-        TMP_MONTHLY, TMP_PRESSURE, ROAD_OUT,
+        TMP_MONTHLY, TMP_PRESSURE, TMP_PRESSURE_FULL, ROAD_OUT,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 

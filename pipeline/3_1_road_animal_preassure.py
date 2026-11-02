@@ -11,12 +11,15 @@ import gc
 import multiprocessing as mp
 import pickle
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra as sp_dijkstra
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString
 from shapely.ops import linemerge
@@ -24,37 +27,81 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.paths import (
-    MOVEMENTS_PKL, CADASTRO_PKL, ROADS_SHP,
-    GRAPH_RAW_CACHE, GRAPH_SIMP_CACHE, ROUTE_CACHE,
-    TMP_MONTHLY, TMP_PRESSURE, ROAD_OUT,
+    MOVEMENTS_PKL, CADASTRO_PKL, ROADS_FULL_SHP,
+    GRAPH_RAW_CACHE_FULL, GRAPH_SIMP_CACHE_FULL, ROUTE_CACHE_FULL,
+    TMP_MONTHLY, TMP_PRESSURE_FULL, ROAD_OUT,
 )
 
 # =============================================================================
 # PATHS & SETTINGS
 # =============================================================================
+ROADS_SHP        = ROADS_FULL_SHP
+GRAPH_RAW_CACHE  = GRAPH_RAW_CACHE_FULL
+GRAPH_SIMP_CACHE = GRAPH_SIMP_CACHE_FULL
+ROUTE_CACHE      = ROUTE_CACHE_FULL
+TMP_PRESSURE     = TMP_PRESSURE_FULL
+
 CRS_GEO      = "EPSG:4326"
 CRS_METRIC   = "EPSG:32722"   # UTM Zone 22S — appropriate for RS, Brazil
 BUFFER_M     = 10_000          # 10 km buffer in metres
-CHUNK_ROUTES = 500             # routes per cache-save batch
 CHUNK_FARMS  = 500             # farms per buffer-intersection batch
 N_WORKERS    = max(1, mp.cpu_count() - 1)   # leave one core free
 
 
 # =============================================================================
-# MODULE-LEVEL GRAPH REFERENCE (populated before Pool creation, inherited by
+# MODULE-LEVEL ROUTING STATE (populated before Pool creation, inherited by
 # fork workers — avoids re-serialising the graph to each worker process).
+#
+# Routing is done as one scipy sparse Dijkstra run per distinct ORIGIN node
+# rather than one networkx shortest_path call per (origin, destination) PAIR.
+# With route pairs sharing a much smaller set of distinct origins
+# (farms/slaughterhouses repeat heavily as movement endpoints), the per-pair
+# approach means re-solving overlapping shortest-path trees from scratch
+# hundreds of thousands of times; per-origin single-source Dijkstra solves
+# each origin's tree once and reads off every needed destination from it.
 # =============================================================================
-_G_routing = None   # set in main body before multiprocessing pool is created
+_CSR_ROUTING = None  # sparse adjacency matrix, set in main body before Pool
+_NODE_IDS    = None  # node_ids list; _NODE_IDS[i] is the row/col i node id
 
 
-def _mp_route_pair(pair):
-    """Worker function: compute shortest path for one node pair."""
-    u, v = pair
-    try:
-        path = nx.shortest_path(_G_routing, u, v, weight="length")
-        return (pair, path)
-    except Exception:
-        return (pair, None)
+def _build_csr_graph(G: nx.Graph, node_index: dict, n_nodes: int) -> csr_matrix:
+    """Undirected sparse adjacency matrix for scipy's Dijkstra, weighted by
+    edge length (metres). Built once from the already-cached simplified graph."""
+    rows, cols, weights = [], [], []
+    for u, v, data in G.edges(data=True):
+        i, j = node_index[u], node_index[v]
+        w = float(data.get("length", 0.0))
+        rows.append(i); cols.append(j); weights.append(w)
+        rows.append(j); cols.append(i); weights.append(w)
+    return csr_matrix((weights, (rows, cols)), shape=(n_nodes, n_nodes))
+
+
+def _mp_route_from_origin(job):
+    """Worker: single-source Dijkstra from one origin node to every target
+    node it needs a route to, returning (origin_idx, {target_idx: path})."""
+    origin_idx, target_idxs = job
+    _, predecessors = sp_dijkstra(
+        csgraph=_CSR_ROUTING, directed=False, indices=origin_idx,
+        return_predecessors=True,
+    )
+    results = {}
+    for t in target_idxs:
+        path_idx = [t]
+        cur = t
+        unreachable = False
+        while cur != origin_idx:
+            nxt = predecessors[cur]
+            if nxt == -9999:
+                unreachable = True
+                break
+            path_idx.append(nxt)
+            cur = nxt
+        if unreachable:
+            results[t] = None
+        else:
+            path_idx.reverse()
+            results[t] = [_NODE_IDS[i] for i in path_idx]
+    return origin_idx, results
 
 
 # =============================================================================
@@ -261,9 +308,11 @@ gc.collect()
 
 # =============================================================================
 # STEP 7: LOAD ROAD NETWORK (OSM roads shapefile → simplified networkx graph)
-# Builds from local roads_rs_major.shp, then contracts degree-2 nodes so
-# only intersections and dead-ends remain.  Reduces ~1 M node graph to
-# ~100 k nodes, making Dijkstra 10–50x faster.
+# Builds from the full road network (raw_data/roads/roads_rs_full.shp, every
+# drivable OSM highway class — built once by pipeline/3_0_download_full_roads.py),
+# then contracts degree-2 nodes so only intersections and dead-ends remain.
+# Reduces a multi-million node graph to a much smaller set of nodes, making
+# Dijkstra 10–50x faster.
 # =============================================================================
 print("\nSTEP 7: Loading OSM road network...")
 
@@ -282,7 +331,11 @@ else:
         print(f"  Raw graph: {len(G_raw.nodes):,} nodes, {len(G_raw.edges):,} edges")
     else:
         if not ROADS_SHP.exists():
-            raise FileNotFoundError(f"Roads shapefile not found: {ROADS_SHP}")
+            raise FileNotFoundError(
+                f"Full road network shapefile not found: {ROADS_SHP}\n"
+                "Run pipeline/3_0_download_full_roads.py first to build it "
+                "(see that script's header for the required Python environment)."
+            )
         roads = gpd.read_file(str(ROADS_SHP)).to_crs(CRS_METRIC)
         print(f"  Loaded {len(roads):,} road segments from {ROADS_SHP.name}")
         G_raw = nx.Graph()
@@ -320,9 +373,10 @@ print(f"  KD-tree ready ({len(node_ids):,} nodes) | {N_WORKERS} routing workers"
 
 
 # =============================================================================
-# STEP 8: SHORTEST PATH COMPUTATION (CHUNKED + DISK CACHE + MULTIPROCESSING)
-# Uses fork context so workers inherit the in-memory graph without
-# re-serialising it.  ox.shortest_path wraps nx.shortest_path (Dijkstra).
+# STEP 8: SHORTEST PATH COMPUTATION (PER-ORIGIN + DISK CACHE + MULTIPROCESSING)
+# One scipy sparse Dijkstra run per distinct origin node (see _mp_route_from_origin
+# above for why), parallelised across workers via fork so each inherits the
+# adjacency matrix without re-serialising it.
 # =============================================================================
 print("\nSTEP 8: Computing shortest paths...")
 
@@ -369,27 +423,54 @@ pairs_todo  = [p for p in all_pairs if p not in route_cache]
 print(f"  {len(pairs_todo):,} new pairs to route | {len(route_cache):,} already cached")
 
 if pairs_todo:
-    # Expose graph to fork workers via module-level global
-    _G_routing = G
+    node_index = {nid: i for i, nid in enumerate(node_ids)}
 
-    chunks   = [pairs_todo[i: i + CHUNK_ROUTES] for i in range(0, len(pairs_todo), CHUNK_ROUTES)]
-    computed = 0
-    failed   = 0
+    print("  Building sparse adjacency matrix for per-origin routing...")
+    csr = _build_csr_graph(G, node_index, len(node_ids))
 
-    # "fork" avoids re-serialising the graph to each worker (copies parent memory)
+    # Group remaining pairs by origin node index: one Dijkstra run per
+    # distinct origin covers every destination that origin needs at once.
+    origin_targets = defaultdict(list)
+    for a, b in pairs_todo:
+        origin_targets[node_index[a]].append(node_index[b])
+    jobs = list(origin_targets.items())
+    print(f"  {len(jobs):,} distinct origins to route from "
+          f"(vs {len(pairs_todo):,} pairs)")
+
+    # Expose routing state to fork workers via module-level globals
+    _CSR_ROUTING = csr
+    _NODE_IDS    = node_ids
+
+    computed   = 0
+    failed     = 0
+    since_save = 0
+    SAVE_EVERY_ORIGINS = 2_000  # flush route_cache to disk periodically
+
+    # "fork" avoids re-serialising the graph/CSR matrix to each worker
     ctx = mp.get_context("fork")
     with ctx.Pool(N_WORKERS) as pool:
-        for chunk in tqdm(chunks, desc="Routing chunks (parallel)"):
-            results = pool.map(_mp_route_pair, chunk)
-            for pair, path in results:
+        for origin_idx, results in tqdm(
+            pool.imap_unordered(_mp_route_from_origin, jobs),
+            total=len(jobs), desc="Routing (per-origin Dijkstra)",
+        ):
+            origin_node = node_ids[origin_idx]
+            for t_idx, path in results.items():
+                target_node = node_ids[t_idx]
+                pair = tuple(sorted((origin_node, target_node)))
                 route_cache[pair] = path
                 if path:
                     computed += 1
                 else:
                     failed += 1
 
-            with open(str(ROUTE_CACHE), "wb") as f:
-                pickle.dump(route_cache, f)
+            since_save += 1
+            if since_save >= SAVE_EVERY_ORIGINS:
+                with open(str(ROUTE_CACHE), "wb") as f:
+                    pickle.dump(route_cache, f)
+                since_save = 0
+
+    with open(str(ROUTE_CACHE), "wb") as f:
+        pickle.dump(route_cache, f)
 
     print(f"  Routing complete — {computed:,} ok, {failed:,} failed")
 

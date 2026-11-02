@@ -19,10 +19,11 @@ The pipeline integrates spatial, network, and environmental data.
 
 ```
 project_root/
-├── pipeline/               # 8 sequential analysis scripts
+├── pipeline/               # 9 sequential analysis scripts
 │   ├── 1_load_data.py
 │   ├── 2_1_javalis_spatial_distribution.py
 │   ├── 2_get_temperature_rs_with_raster.py
+│   ├── 3_0_download_full_roads.py    # one-time, run manually (see below)
 │   ├── 3_1_road_animal_preassure.py
 │   ├── 3_get_spatial_net_features.py
 │   ├── 5_distance_to_border.py
@@ -38,7 +39,8 @@ project_root/
 │   │   ├── capri_movs/
 │   │   └── suine_movs/
 │   ├── javali_data/        # Wild boar (javali) survey Excel file
-│   ├── roads/              # roads_rs_major.shp
+│   ├── roads/              # roads_rs_major.shp (reference), roads_rs_full.shp (used by the pipeline)
+│   ├── osm/                # Cached Brazil OSM extract (built by 3_0_download_full_roads.py)
 │   ├── rs_boundary_ibge/   # RS_UF_2024.shp (optional, for border clipping)
 │   ├── border/             # Natural Earth border lines (auto-downloaded)
 │   └── hydro/              # Natural Earth rivers (auto-downloaded)
@@ -49,10 +51,17 @@ project_root/
 │   ├── LST_raster/         # Monthly MODIS temperature GeoTIFFs
 │   ├── road_pressure/      # Shapefile outputs from the routing step
 │   ├── tmp_monthly_flows/  # Monthly movement aggregations
-│   └── tmp_road_pressure/  # Monthly road-pressure GPKG layers
+│   └── tmp_road_pressure_full/  # Monthly road-pressure GPKG layers
 │
 ├── results/                # Final pipeline outputs
-│   └── fmd_risk_scored.csv         ← primary deliverable
+│   ├── fmd_risk_scored.csv         ← primary deliverable
+│   ├── fmd_risk_scored.pkl
+│   ├── top50_high_risk_farms.csv
+│   ├── component_weights.csv
+│   ├── risk_score_summary_stats.csv
+│   ├── sensitivity_analysis.csv
+│   ├── sensitivity_spearman_corr.csv
+│   └── plot*.png                   ← diagnostic plots
 │
 ├── credentials/            # OAuth / API secrets (NOT version-controlled)
 │   └── client_secret_*.json
@@ -86,11 +95,16 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 ```bash
 pip install pandas geopandas numpy scikit-learn networkx scipy \
-            libpysal geobr matplotlib rasterio geemap \
+            libpysal geobr matplotlib seaborn rasterio geemap \
             earthengine-api pydrive tqdm openpyxl
 ```
 
 > **Note:** `geobr` fetches IBGE municipality boundaries on first use; an internet connection is required.
+
+> **Note:** `3_0_download_full_roads.py` additionally needs `pyrosm`
+> (`pip install pyrosm`), which is not required by any other step — see
+> that script's header for why it may need to run under a separate Python
+> environment.
 
 ---
 
@@ -119,6 +133,20 @@ require access to **Google Earth Engine** and **Google Drive**.
 
 ## Running the pipeline
 
+### One-time setup: full road network
+
+`3_1_road_animal_preassure.py` and `3_get_spatial_net_features.py` route
+against `raw_data/roads/roads_rs_full.shp` (every drivable OSM highway
+class, not just major roads). Build it once before the first run:
+
+```bash
+python pipeline/3_0_download_full_roads.py
+```
+
+This is not part of `run_pipeline.py`'s automatic sequence — it downloads a
+large OSM extract and may need a separate Python environment (see the
+script's header).
+
 ### Full pipeline (steps 1 – 8)
 
 ```bash
@@ -143,8 +171,8 @@ the pipeline stops immediately and reports the step number that failed.
 | 1 | `1_load_data.py` | Loads farm registry (cadastro) and GTAS movement CSVs | No |
 | 2 | `2_1_javalis_spatial_distribution.py` | Spatial smoothing of wild boar (javali) risk (Queen spatial weights) | No |
 | 3 | `2_get_temperature_rs_with_raster.py` | Downloads MODIS LST via Earth Engine + computes FMD survival probability | Yes (download) |
-| 4 | `3_1_road_animal_preassure.py` | OSM road routing + farm exposure via buffer | **Very heavy** (cached) |
-| 5 | `3_get_spatial_net_features.py` | Network analysis, farm density, animal pressure, road distances | Moderate |
+| 4 | `3_1_road_animal_preassure.py` | OSM road routing (full network) + farm exposure via buffer | **Very heavy** (cached) |
+| 5 | `3_get_spatial_net_features.py` | Network analysis, farm density, species-weighted animal pressure, road distances. Accepts an optional subset of components to (re)run, e.g. `python pipeline/3_get_spatial_net_features.py farm_density animal_pressure` | Moderate |
 | 6 | `5_distance_to_border.py` | Distance to international border (auto-download from Natural Earth) | No |
 | 7 | `7_combine_and_check_data.py` | Consolidates all feature sets | No |
 | 8 | `8_fmd_risk_analysis.py` | Computes composite risk scores + sensitivity analysis + plots | No |
@@ -157,7 +185,17 @@ After a successful run, `results/` will contain:
 
 | File | Description |
 |------|-------------|
-| `fmd_risk_scored.csv` | **Primary output** — every farm with both risk scores and 8 normalized components |
+| `fmd_risk_scored.csv` / `.pkl` | **Primary output** — every farm with both risk scores and 8 normalized components |
+| `top50_high_risk_farms.csv` | Top 50 farms by epi-weighted score |
+| `component_weights.csv` | Equal vs. epi weight per component, for reproducibility |
+| `risk_score_summary_stats.csv` | Summary statistics for both scores and all normalized components |
+| `sensitivity_analysis.csv` | Top-N rank stability per ±20% perturbed weight |
+| `sensitivity_spearman_corr.csv` | Full Spearman correlation matrix across perturbed score variants |
+| `plot1_risk_score_histograms.png` | Equal-weight vs. epi-weight score distributions |
+| `plot2_equal_vs_epi_scores.png` | Equal-weight vs. epi-weight score scatter |
+| `plot3_components_vs_epi_score.png` | Top-4 weighted components vs. epi score |
+| `plot5_sensitivity_heatmap.png` | Sensitivity analysis correlation heatmap |
+| `plot7_component_correlation.png` | Spearman correlation among normalized components |
 
 ---
 
@@ -167,11 +205,15 @@ Step 4 (road animal pressure) builds a road-network graph and computes shortest 
 for every farm pair — this can take several hours on the first run.  
 Intermediate results are cached in `intermediate/`:
 
-- `graph_rs_roads.pkl` — raw OSM graph
-- `graph_rs_roads_simplified.pkl` — contracted (degree-2) graph
-- `routes_roads_cache.pkl` — computed shortest paths
+- `graph_rs_roads_full.pkl` — raw OSM graph (full road network)
+- `graph_rs_roads_full_simplified.pkl` — contracted (degree-2) graph
+- `routes_roads_full_cache.pkl` — computed shortest paths
 - `tmp_monthly_flows/*.pkl` — monthly movement aggregations
-- `tmp_road_pressure/*.gpkg` — monthly road-pressure layers
+- `tmp_road_pressure_full/*.gpkg` — monthly road-pressure layers
+
+These are named `*_full*` so they are never silently reused if you also keep
+a major-roads-only run around (`src/paths.py` still defines the
+non-`_FULL` constants for reference/comparison).
 
 On subsequent runs, cached files are reused automatically.  
 To force full recomputation, delete the relevant cache files in `intermediate/`.

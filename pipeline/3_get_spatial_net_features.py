@@ -17,10 +17,17 @@ import pickle
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.paths import (
-    CADASTRO_PKL, MOVEMENTS_PKL, ROADS_SHP, INTERMEDIATE,
+    CADASTRO_PKL, MOVEMENTS_PKL, ROADS_FULL_SHP, INTERMEDIATE,
     NETWORK_PKL, FARM_DENSITY_PKL, ANIMAL_PRESSURE_PKL,
     DISTANCE_ROADS_PKL, SLAUGHTERHOUSE_PKL,
 )
+
+# Optional subset of components to (re)compute, e.g.
+#   python3 3_get_spatial_net_features.py farm_density animal_pressure
+# With no (recognised) arguments every component runs, as before.
+STEP3_COMPONENTS = {"network", "farm_density", "animal_pressure", "roads", "slaughterhouse"}
+RUN_COMPONENTS = (set(sys.argv[1:]) & STEP3_COMPONENTS) or STEP3_COMPONENTS
+print(f"Step 3 components to run: {sorted(RUN_COMPONENTS)}")
 
 # Load data from pickles
 with open(str(CADASTRO_PKL), 'rb') as file:
@@ -218,16 +225,22 @@ def build_movement_network(file_path, out_pkl=None):
 
     return degree_df
 
-network = build_movement_network(
-    MOVEMENTS_PKL,
-    out_pkl=NETWORK_PKL,
-)
+if "network" in RUN_COMPONENTS:
+    network = build_movement_network(
+        MOVEMENTS_PKL,
+        out_pkl=NETWORK_PKL,
+    )
 
 
 #Farm density within radius
-def farm_density_pressure(gdf, radius_m=10000, out_pkl=None):
+def farm_density_pressure(gdf, radius_m=10000, id_col="COD_PROPRIEDADE_RURAL", out_pkl=None):
     # drop rows without geometry or with invalid coords
     gdf = gdf.dropna(subset=["geometry"]).copy()
+    # cadastro is long-format (one row per farm-species); count FARMS, not
+    # rows, so keep one point per farm (first declared coordinate) before
+    # building the tree — otherwise multi-species farms count their own
+    # extra rows, and their neighbours' extra rows, as neighbouring farms.
+    gdf = gdf.drop_duplicates(subset=[id_col], keep="first")
     gdf_m = gdf.to_crs(epsg=3857)
     gdf_m = gdf_m[np.isfinite(gdf_m.geometry.x) & np.isfinite(gdf_m.geometry.y)].copy()
 
@@ -250,198 +263,166 @@ def farm_density_pressure(gdf, radius_m=10000, out_pkl=None):
 
     return gdf_m
 
-farm_density_pressuredf = farm_density_pressure(
-    gdf=gdf,
-    radius_m=10000,
-    out_pkl=FARM_DENSITY_PKL,
-)
-
-# animal desnisty presuare ---
-def _animal_pressure_one_species(
-    sp,
-    sp_gdf,
-    radius_m,
-    chunk_size,
-    use_float32,
-    tile_size_m,
-    capacity_col,
-):
-    if sp_gdf.empty:
-        return sp, sp_gdf
-
-    sp_gdf = sp_gdf.reset_index(drop=True)
-    cap_all = sp_gdf[capacity_col].values
-    sp_gdf["tile_x"] = np.floor(sp_gdf["x"] / tile_size_m).astype(int)
-    sp_gdf["tile_y"] = np.floor(sp_gdf["y"] / tile_size_m).astype(int)
-
-    pressure = np.zeros(len(sp_gdf), dtype=float)
-
-    for (_tx, _ty), tile_core in sp_gdf.groupby(["tile_x", "tile_y"]):
-        if tile_core.empty:
-            continue
-        minx = tile_core["x"].min() - radius_m
-        maxx = tile_core["x"].max() + radius_m
-        miny = tile_core["y"].min() - radius_m
-        maxy = tile_core["y"].max() + radius_m
-
-        candidates = sp_gdf[
-            (sp_gdf["x"] >= minx)
-            & (sp_gdf["x"] <= maxx)
-            & (sp_gdf["y"] >= miny)
-            & (sp_gdf["y"] <= maxy)
-        ]
-        if candidates.empty:
-            continue
-
-        cand_coords = candidates[["x", "y"]].values
-        if use_float32:
-            cand_coords = cand_coords.astype("float32")
-        tree = BallTree(cand_coords, metric="euclidean")
-        cand_capacity = candidates[capacity_col].values
-
-        core_idx = tile_core.index.to_numpy()
-        core_coords = sp_gdf.loc[core_idx, ["x", "y"]].values
-        if use_float32:
-            core_coords = core_coords.astype("float32")
-
-        for start in range(0, len(core_coords), chunk_size):
-            end = min(start + chunk_size, len(core_coords))
-            neighbors = tree.query_radius(core_coords[start:end], r=radius_m)
-            for j, idx in enumerate(neighbors):
-                core_pos = core_idx[start + j]
-                pressure[core_pos] = cand_capacity[idx].sum() - cap_all[core_pos]
-
-    sp_gdf["birds_within_5km"] = pressure
-    x = pressure
-    sp_gdf["birds_pressure_normalized"] = (
-        (x - x.min()) / (x.max() - x.min()) if x.max() != x.min() else 0
+if "farm_density" in RUN_COMPONENTS:
+    farm_density_pressuredf = farm_density_pressure(
+        gdf=gdf,
+        radius_m=10000,
+        out_pkl=FARM_DENSITY_PKL,
     )
-    sp_gdf = sp_gdf.drop(columns=["x", "y", "tile_x", "tile_y"])
-    return sp, sp_gdf
+
+# ============================================
+# ANIMAL PRESSURE (host density within 10 km, geodesic, species-weighted)
+# ============================================
+EARTH_RADIUS_KM = 6371.0
+
+# Species-specific FMDV shedding weight, relative to cattle = 1.
+# Pigs excrete airborne FMDV at ~50-100x the rate of cattle/sheep for most
+# strains (up to ~1000x for high-shedding strains like C Noville).
+# Sources: Donaldson, Herniman, Parker & Sellers (1970, J Hyg Cambridge);
+# Alexandersen & Donaldson (2002, Epidemiology and Infection); synthesized
+# in Sørensen et al. (2003, DMI Scientific Report SR03-17).
+# w=50 is the conservative end of the typical-strain range.
+# Bubalinos (buffalo) is an ASSUMPTION: no buffalo-specific FMDV shedding
+# data was found; treated as cattle-equivalent (both large ruminant bovids).
+SPECIES_WEIGHTS = {
+    "Suíno": 50,
+    "Bovinos": 1,
+    "Ovino": 1,
+    "Caprinos": 1,
+    "Bubalinos": 1,
+}
 
 
-#animal capacity pressure (by species)
-def animal_pressure_within_radius(
-    gdf_m,
-    radius_m=10000,
+def animal_pressure_weighted_10km(
+    gdf,
+    radius_km=10,
     species_col="ESPECIE_ANIMAL",
     capacity_col="QTD_DECLARADA",
     id_col="COD_PROPRIEDADE_RURAL",
-    out_dir=None,
-    chunk_size=2000,
-    use_float32=True,
-    epsg_m=3857,
-    tile_size_m=20000,
-    keep_cols=None,
-    parallel=True,
-    max_workers=4,
-    return_combined=True,
+    lat_col="LATITUDE_DECIMAL",
+    lon_col="LONGITUDE_DECIMAL",
+    out_pkl=None,
 ):
-    # project to metric CRS if needed
-    if gdf_m.crs is None or gdf_m.crs.to_epsg() != epsg_m:
-        gdf_m = gdf_m.to_crs(epsg=epsg_m)
+    """
+    Farm-level animal pressure: for each farm i, the species-weighted sum of
+    FMD-susceptible headcounts at all OTHER farms j within radius_km true
+    geodesic (haversine) distance, excluding farm i's own rows:
 
-    if keep_cols is None:
-        keep_cols = [species_col, capacity_col, "geometry"]
-        if id_col in gdf_m.columns:
-            keep_cols.append(id_col)
-    gdf_m = gdf_m[keep_cols].copy()
+        A_i = sum_{j != i, d(i,j) <= radius_km} w(species_j) * Q_j
 
-    # drop rows without geometry or without species/capacity
-    gdf_m = gdf_m.dropna(subset=["geometry", species_col, capacity_col]).copy()
-    gdf_m["x"] = gdf_m.geometry.x
-    gdf_m["y"] = gdf_m.geometry.y
-    gdf_m = gdf_m[np.isfinite(gdf_m["x"]) & np.isfinite(gdf_m["y"])].copy()
-    gdf_m[capacity_col] = pd.to_numeric(gdf_m[capacity_col], errors="coerce").fillna(0)
+    A farm may have more than one row (one per FMD-susceptible species it
+    declared); self-exclusion is applied at the farm level — summing out ALL
+    of that farm's own rows — not the row level. Most farms' rows share an
+    identical coordinate, but a small number show coordinate drift between
+    declarations (re-geocoding between visits); for those, querying from only
+    one representative row would silently miss the drifted row's own
+    neighborhood and could subtract more "own weight" than was ever added,
+    producing a negative pressure value. See the fast/slow path split below.
+    """
+    df = gdf[[id_col, species_col, capacity_col, lat_col, lon_col]].dropna(
+        subset=[species_col, capacity_col, lat_col, lon_col]
+    ).copy()
+    df[capacity_col] = pd.to_numeric(df[capacity_col], errors="coerce")
+    df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
+    df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+    df = df.dropna(subset=[capacity_col, lat_col, lon_col]).reset_index(drop=True)
 
-    results = []
-    groups = list(gdf_m.groupby(species_col))
-    # Use threads, not processes: BallTree construction and query_radius release
-    # the GIL, so threads parallelize the heavy work without pickling large
-    # GeoDataFrames to workers — and without the macOS spawn / native-lib crashes
-    # (BrokenProcessPool) that ProcessPoolExecutor caused here. This matches the
-    # thread backend already used for the network/density features above.
-    if parallel and max_workers > 1 and len(groups) > 1:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for sp, sp_gdf in groups:
-                futures.append(
-                    executor.submit(
-                        _animal_pressure_one_species,
-                        sp,
-                        sp_gdf,
-                        radius_m,
-                        chunk_size,
-                        use_float32,
-                        tile_size_m,
-                        capacity_col,
-                    )
-                )
-            for fut in as_completed(futures):
-                sp, sp_gdf = fut.result()
-                if sp_gdf is None or sp_gdf.empty:
-                    continue
-                if out_dir:
-                    sp_safe = (
-                        str(sp)
-                        .strip()
-                        .replace(" ", "_")
-                        .replace("/", "_")
-                        .replace("\\", "_")
-                    )
-                    out_path = Path(out_dir) / f"animal_pressure_within_radius_{sp_safe}.pkl"
-                    sp_gdf.to_pickle(str(out_path))
-                if return_combined:
-                    results.append(sp_gdf)
-    else:
-        for sp, sp_gdf in groups:
-            sp, sp_gdf = _animal_pressure_one_species(
-                sp,
-                sp_gdf,
-                radius_m,
-                chunk_size,
-                use_float32,
-                tile_size_m,
-                capacity_col,
-            )
-            if sp_gdf is None or sp_gdf.empty:
-                continue
-            if out_dir:
-                sp_safe = (
-                    str(sp)
-                    .strip()
-                    .replace(" ", "_")
-                    .replace("/", "_")
-                    .replace("\\", "_")
-                )
-                out_path = Path(out_dir) / f"animal_pressure_within_radius_{sp_safe}.pkl"
-                sp_gdf.to_pickle(str(out_path))
-            if return_combined:
-                results.append(sp_gdf)
+    unmapped = set(df[species_col].unique()) - set(SPECIES_WEIGHTS)
+    if unmapped:
+        raise ValueError(f"Unmapped species in SPECIES_WEIGHTS: {sorted(unmapped)}")
+    df["row_weight"] = df[species_col].map(SPECIES_WEIGHTS) * df[capacity_col]
 
-    if not results:
-        return gdf_m.iloc[0:0].copy()
+    coords_rad = np.deg2rad(df[[lat_col, lon_col]].values)
+    tree = BallTree(coords_rad, metric="haversine")
+    radius_rad = radius_km / EARTH_RADIUS_KM
 
-    return pd.concat(results, ignore_index=True)
+    row_weight = df["row_weight"].values
+    capacity = df[capacity_col].values
+    is_swine = (df[species_col] == "Suíno").values
+    swine_weight = SPECIES_WEIGHTS["Suíno"]
 
-if __name__ == "__main__":
-    animal_pressure_within_radius_df = animal_pressure_within_radius(
-        gdf_m=gdf,
-        radius_m=10000,
+    farm_row_positions = df.groupby(id_col).indices
+    unique_farm_ids = np.array(list(farm_row_positions.keys()))
+
+    # Almost every farm's own rows share one coordinate, so one query per
+    # farm (using a representative row) is enough and is fully vectorized.
+    # A small minority show coordinate drift between declarations
+    # (re-geocoding between visits) — those need the slower per-row
+    # neighbor union below. Flagging them up front keeps the fast path fast
+    # instead of paying union/dedup cost for every farm.
+    coord_nunique = df.groupby(id_col)[[lat_col, lon_col]].nunique()
+    drifted_farm_ids = set(
+        coord_nunique.index[(coord_nunique[lat_col] > 1) | (coord_nunique[lon_col] > 1)]
+    )
+    simple_farm_ids = [f for f in unique_farm_ids if f not in drifted_farm_ids]
+
+    def _farm_pressure(neigh, own_pos):
+        total_weighted = row_weight[neigh].sum()
+        own_weighted = row_weight[own_pos].sum()
+        pressure = total_weighted - own_weighted
+
+        swine_neighbor_qty_raw = (
+            capacity[neigh][is_swine[neigh]].sum()
+            - capacity[own_pos][is_swine[own_pos]].sum()
+        )
+        nonswine_weighted_neighbor_qty = pressure - swine_weight * swine_neighbor_qty_raw
+        return pressure, swine_neighbor_qty_raw, nonswine_weighted_neighbor_qty
+
+    records = []
+
+    if simple_farm_ids:
+        first_pos = np.array([farm_row_positions[f][0] for f in simple_farm_ids])
+        neighbor_idx_simple = tree.query_radius(coords_rad[first_pos], r=radius_rad)
+        for farm_id, neigh in zip(simple_farm_ids, neighbor_idx_simple):
+            own_pos = farm_row_positions[farm_id]
+            records.append((farm_id, *_farm_pressure(neigh, own_pos)))
+
+    if drifted_farm_ids:
+        drifted_positions = np.unique(
+            np.concatenate([farm_row_positions[f] for f in drifted_farm_ids])
+        )
+        neighbor_idx_drifted = tree.query_radius(coords_rad[drifted_positions], r=radius_rad)
+        pos_to_neighbors = dict(zip(drifted_positions, neighbor_idx_drifted))
+        for farm_id in drifted_farm_ids:
+            own_pos = np.asarray(farm_row_positions[farm_id])
+            neigh = np.unique(np.concatenate([pos_to_neighbors[p] for p in own_pos]))
+            records.append((farm_id, *_farm_pressure(neigh, own_pos)))
+
+    out = pd.DataFrame(
+        records,
+        columns=[
+            id_col,
+            "animal_pressure_weighted_10km",
+            "swine_neighbor_qty_raw",
+            "nonswine_weighted_neighbor_qty",
+        ],
+    )
+    x = out["animal_pressure_weighted_10km"].values.astype(float)
+    out["animal_pressure_weighted_10km_norm"] = (
+        (x - x.min()) / (x.max() - x.min()) if x.max() != x.min() else 0.0
+    )
+
+    if out_pkl:
+        out.to_pickle(str(out_pkl))
+
+    return out
+
+
+if __name__ == "__main__" and "animal_pressure" in RUN_COMPONENTS:
+    animal_pressure_within_radius_df = animal_pressure_weighted_10km(
+        gdf=gdf,
+        radius_km=10,
         species_col="ESPECIE_ANIMAL",
         capacity_col="QTD_DECLARADA",
         id_col="COD_PROPRIEDADE_RURAL",
-        out_dir=str(INTERMEDIATE),
-        chunk_size=1000,
-        tile_size_m=2000,   # adjust if needed
-        epsg_m=3857,         # metric CRS
-        parallel=True,
-        max_workers=4,
-        return_combined=True,
+        lat_col="LATITUDE_DECIMAL",
+        lon_col="LONGITUDE_DECIMAL",
+        out_pkl=ANIMAL_PRESSURE_PKL,
     )
-
-    # Save combined animal pressure
-    animal_pressure_within_radius_df.to_pickle(str(ANIMAL_PRESSURE_PKL))
+    print(
+        f"  Animal pressure (species-weighted, 10 km geodesic): "
+        f"{animal_pressure_within_radius_df['COD_PROPRIEDADE_RURAL'].nunique():,} farms"
+    )
 
 
 
@@ -553,20 +534,32 @@ def distance_to_roads_efficient(
 
     return farms
 
-distance_to_roadsdf = distance_to_roads_efficient(
-    gdf_farms=gdf,
-    roads_shp=ROADS_SHP,
-    epsg_m=31982,
-    out_pkl=DISTANCE_ROADS_PKL,
-    parallel=True,
-    max_workers=4,
-    parallel_backend="thread",  # safe in interactive
-)
+if "roads" in RUN_COMPONENTS:
+    import multiprocessing as mp
+    # Processes only where fork is the start method (Linux): under spawn
+    # (macOS default) each worker would re-import this module and re-run
+    # every module-level component, so keep the 4-thread setup there.
+    _fork = mp.get_start_method() == "fork"
+    _road_workers = min(48, os.cpu_count() or 4) if _fork else 4
+    # cadastro is long-format; distances depend only on the farm point, so
+    # compute once per farm (first declared coordinate, as in step 7).
+    _farms_once = gdf.drop_duplicates(subset=["COD_PROPRIEDADE_RURAL"], keep="first")
+    distance_to_roadsdf = distance_to_roads_efficient(
+        gdf_farms=_farms_once,
+        roads_shp=ROADS_FULL_SHP,
+        epsg_m=31982,
+        out_pkl=DISTANCE_ROADS_PKL,
+        parallel=True,
+        max_workers=_road_workers,
+        # one chunk per worker so the roads layer is pickled once per worker
+        chunk_size=-(-len(_farms_once) // _road_workers) if _fork else 2000,
+        parallel_backend="process" if _fork else "thread",  # thread is safe in interactive
+    )
 
 # ============================================
 # SLAUGHTERHOUSE PROXIMITY RISK
 # ============================================
-EARTH_RADIUS_KM = 6371.0
+# EARTH_RADIUS_KM is defined above, in the animal-pressure section.
 SLAUGHTER_CUTOFF_KM = 5.0
 
 
@@ -695,11 +688,12 @@ def slaughterhouse_proximity_risk(
     return farms
 
 
-slaughterhouse_df = slaughterhouse_proximity_risk(
-    cadastro_pkl=CADASTRO_PKL,
-    movements_pkl=MOVEMENTS_PKL,
-    out_pkl=SLAUGHTERHOUSE_PKL,
-)
+if "slaughterhouse" in RUN_COMPONENTS:
+    slaughterhouse_df = slaughterhouse_proximity_risk(
+        cadastro_pkl=CADASTRO_PKL,
+        movements_pkl=MOVEMENTS_PKL,
+        out_pkl=SLAUGHTERHOUSE_PKL,
+    )
 
 
 # ============================================
@@ -717,10 +711,10 @@ slaughterhouse_df = slaughterhouse_proximity_risk(
 #    → intermediate/farm_density_pressure.pkl
 #    Columns: n_neighbors_5km, pressure_rank, n_neighbors_5km_normalized
 #
-# 3. ANIMAL PRESSURE
+# 3. ANIMAL PRESSURE (species-weighted, 10 km geodesic)
 #    → intermediate/animal_pressure_within_radius.pkl
-#    Columns: birds_within_5km, birds_pressure_normalized (by species)
-#    Also individual species files saved to intermediate/
+#    Columns: animal_pressure_weighted_10km, animal_pressure_weighted_10km_norm,
+#             swine_neighbor_qty_raw, nonswine_weighted_neighbor_qty
 #
 # 4. DISTANCE TO ROADS
 #    → intermediate/distance_to_roads.pkl

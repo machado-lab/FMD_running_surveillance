@@ -15,6 +15,10 @@ Steps:
     4  Distance to international border
     5  Combine and validate all features
     6  FMD risk analysis → results/fmd_risk_scored.csv
+
+Before the first run, build the full road network once (not part of this
+automatic sequence — see that script's header):
+    python pipeline/3_0_download_full_roads.py
 """
 
 import argparse

@@ -90,6 +90,35 @@ with open(str(SLAUGHTERHOUSE_PKL), "rb") as f:
 
 
 #================================================================#
+#  Collapse cadastro to one row per farm.
+#
+#  cadastro.pkl is long-format (one row per farm-species combination —
+#  restored by 1_load_data.py's fix to the per-species collapse bug).
+#  Every other farm-level feature merged below (network, farm/animal
+#  pressure, roads, weather, borders, javali, slaughterhouse) expects
+#  exactly one row per COD_PROPRIEDADE_RURAL, so collapse here, before any
+#  of those merges, rather than relying on drop_duplicates() further down
+#  to paper over a many-rows-per-farm table.
+#================================================================#
+_id = "COD_PROPRIEDADE_RURAL"
+_first_cols = [c for c in cadastro.columns if c not in ("ESPECIE_ANIMAL", "QTD_DECLARADA", _id)]
+
+_nunique_per_farm = cadastro.groupby(_id)[_first_cols].nunique(dropna=False)
+_mismatched = (_nunique_per_farm > 1).any(axis=1)
+if _mismatched.any():
+    print(f"WARNING: {_mismatched.sum()} farms have inconsistent values across "
+          f"their species rows for one or more of {_first_cols} — using the "
+          f"first non-null value per farm (likely minor geocoding drift "
+          f"between declarations, not expected to be common).")
+
+cadastro_farm = cadastro.groupby(_id, as_index=False)[_first_cols].first()
+cadastro_farm["QTD_DECLARADA_total"] = (
+    cadastro.groupby(_id)["QTD_DECLARADA"].sum().values
+)
+cadastro = cadastro_farm
+assert not cadastro[_id].duplicated().any(), "cadastro must be one row per farm after collapse"
+
+#================================================================#
 #  Combine all datasets
 #================================================================#
 combined_df = cadastro.copy()
@@ -114,10 +143,14 @@ farm_pressure_df = farm_pressure_df[["COD_PROPRIEDADE_RURAL", "n_neighbors_5km"]
 farm_pressure_df = farm_pressure_df.drop_duplicates(subset=["COD_PROPRIEDADE_RURAL"])
 combined_df = combined_df.merge(farm_pressure_df, on=['COD_PROPRIEDADE_RURAL'], how='left', suffixes=('', '_farm'))
 
-# Merge animal pressure
-animal_pressure_df = animal_pressure_df[["COD_PROPRIEDADE_RURAL", "birds_within_5km"]].copy()
-animal_pressure_df = animal_pressure_df.rename(columns={"birds_within_5km": "animals_within_5km"})
-animal_pressure_df = animal_pressure_df.drop_duplicates(subset=["COD_PROPRIEDADE_RURAL"])
+# Merge animal pressure — animal_pressure_within_radius.pkl is already one
+# row per farm (species-weighted cross-species sum computed in
+# pipeline/3_get_spatial_net_features.py), so this is a plain 1:1 merge;
+# assert it, rather than silently relying on drop_duplicates to paper over
+# a many-rows-per-farm table.
+animal_pressure_df = animal_pressure_df[["COD_PROPRIEDADE_RURAL", "animal_pressure_weighted_10km"]].copy()
+assert not animal_pressure_df["COD_PROPRIEDADE_RURAL"].duplicated().any(), \
+    "animal pressure output must be one row per farm"
 combined_df = combined_df.merge(animal_pressure_df, on="COD_PROPRIEDADE_RURAL", how="left")
 
 # Merge roads — keep raw sum-distance for road_exposure_risk_raw computation
@@ -147,6 +180,7 @@ print(f"After all merges — unique farms: {combined_df['COD_PROPRIEDADE_RURAL']
 #merge distance to slaughterhouses
 abate_distance.columns
 abate_distance = abate_distance[["COD_PROPRIEDADE_RURAL", "slaughterhouse_risk"]].copy()
+abate_distance = abate_distance.drop_duplicates(subset=["COD_PROPRIEDADE_RURAL"])
 combined_df = combined_df.merge(abate_distance, left_on = "COD_PROPRIEDADE_RURAL", right_on = "COD_PROPRIEDADE_RURAL", how = "left" )
 
 # Merge road animal pressure
@@ -204,10 +238,16 @@ combined_df = combined_df.drop(columns=["total_pres", "dist_3_roads_sum_m"])
 #================================================================#
 #  Filtering by FMD susceptible species
 #================================================================#
-combined_df["ESPECIE_ANIMAL"].unique()
-fmd_species = ["Bovinos", "Suíno", "Caprinos", "Bubalinos"]
-# filter to farms with at least one of the FMD susceptible species
-combined_df["has_fmd_species"] = combined_df["ESPECIE_ANIMAL"].isin(fmd_species)
+# dominant_species (set in pipeline/1_load_data.py) is already drawn only
+# from FMD-susceptible species — this is now a defensive check, not an
+# operative row filter: it should drop 0 rows by construction.
+FMD_SPECIES = ["Bovinos", "Bubalinos", "Ovino", "Suíno", "Caprinos"]
+combined_df["has_fmd_species"] = combined_df["dominant_species"].isin(FMD_SPECIES)
+n_dropped = (~combined_df["has_fmd_species"]).sum()
+if n_dropped:
+    print(f"WARNING: dropping {n_dropped} farms with a dominant_species outside "
+          f"{FMD_SPECIES} — this should not happen if 1_load_data.py's FMD_SPECIES "
+          f"filter ran correctly upstream.")
 combined_df = combined_df[combined_df["has_fmd_species"]].copy()
 combined_df = combined_df.drop(columns=["has_fmd_species"])
 print("Combined dataset shape after filtering for FMD susceptible species:", combined_df.shape)
