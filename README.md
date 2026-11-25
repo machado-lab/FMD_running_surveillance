@@ -234,3 +234,13 @@ Every path derives from `BASE_DIR = Path(__file__).resolve().parent.parent`
 - The pipeline was developed for RS, Brazil, using Brazilian government data formats.
 - The scientific logic (algorithms, weights, model architecture) is unchanged from the original research version.
 - Steps 2b and 4 require internet on the first run (Earth Engine download; the Natural Earth border auto-download in step 6 also needs internet).
+
+## LINCENCE
+
+Copyright (c) 2026 machado-lab
+
+All Rights Reserved.
+
+No part of this software may be copied, modified, distributed, sublicensed, or commercially or otherwise used without prior written permission from the copyright holder.
+
+Permission is granted only upon written approval by the copyright holder.
